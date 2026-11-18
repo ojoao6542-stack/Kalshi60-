@@ -39,7 +39,7 @@ def db(write=False):
 
 def initial():
     return dict(seen=0, online=[0.0]*5, active=None, frozen=None, epoch=0, cap=20,
-                family="candles_v1", active_name="60% chart forecast", last_review=None)
+                family="candles_v1", last_review=None)
 
 
 def init():
@@ -63,10 +63,15 @@ def init():
         c.execute("""CREATE TABLE IF NOT EXISTS ticks(ticker TEXT, ts REAL, close REAL, target REAL,
                      yes REAL, no REAL, mid REAL, PRIMARY KEY(ticker,ts))""")
         c.execute("CREATE TABLE IF NOT EXISTS chart_cache(id INTEGER PRIMARY KEY, end INTEGER, forecast TEXT)")
-        c.execute("DROP TRIGGER IF EXISTS start_cadence")
+        c.execute("CREATE TABLE IF NOT EXISTS cadence(account INTEGER PRIMARY KEY, started REAL NOT NULL)")
+        c.execute("""CREATE TRIGGER IF NOT EXISTS start_cadence AFTER INSERT ON v5_accounts
+                     BEGIN INSERT INTO cadence VALUES(NEW.id, strftime('%s','now')); END""")
+        c.execute("INSERT OR IGNORE INTO cadence SELECT id, ? FROM v5_accounts", (time.time(),))
         c.execute("INSERT OR IGNORE INTO v5_accounts(id,model) VALUES(1,?)", (json.dumps(initial()),))
         current = account(c)
-        if json.loads(current["model"]).get("family") != "candles_v1":
+        model = json.loads(current["model"])
+        legacy_name = str(model.get("active_name", "")).strip().casefold()
+        if model.get("family") != "candles_v1" or legacy_name == "v4 baseline":
             c.execute("UPDATE v5_accounts SET model=? WHERE id=?", (json.dumps(initial()), current["id"]))
 
 
@@ -186,6 +191,45 @@ def load_chart(now):
     return chart
 
 
+def cadence_deadline(c, aid):
+    anchor = c.execute("""SELECT COALESCE(
+        (SELECT MAX(opened) FROM observations WHERE account=? AND actual IS NOT NULL),
+        (SELECT started FROM cadence WHERE account=?))""", (aid, aid)).fetchone()[0]
+    return anchor + 1800
+
+
+def cost(price, contracts):
+    return float(Decimal(str(price)) * contracts), 0
+
+
+def timed_entry(c, account_row, q, p_yes, now):
+    count, reserved = open_risk(c, account_row["id"])
+    budget = min(50, account_row["cash"], DAILY + daily(c, account_row["id"], now) - reserved)
+    if count >= MAX_POSITIONS or budget < 20:
+        return None, "30-minute entry waiting for paper risk budget"
+    candidates = []
+    for side, confidence in (("YES", p_yes), ("NO", 1 - p_yes)):
+        price, depth = q[side]
+        # Binary search for the smallest whole-contract fill reaching $20.
+        low, high = 1, min(depth, math.ceil(20 / price) + 1)
+        if high < 1:
+            continue
+        while low < high:
+            mid = (low + high) // 2
+            if cost(price, mid)[0] < 20:
+                low = mid + 1
+            else:
+                high = mid
+        paid, fee = cost(price, low)
+        if 20 <= paid <= budget:
+            order = dict(side=side, confidence=confidence, n=low, price=price,
+                         paid=paid, fee=fee, timed=True)
+            candidates.append((confidence - paid / low, confidence, order))
+    if not candidates:
+        return None, "30-minute entry waiting for enough quote depth or cash"
+    return max(candidates, key=lambda item: item[:2])[2], "Opened 30-minute paper entry"
+
+
 def record(aid, m, close, now, chart):
     ticker = m["ticker"]
     q = quotes(m)
@@ -241,6 +285,10 @@ def record(aid, m, close, now, chart):
                 target = max(model["cap"], float(min_contracts * unit))
                 actual = entry(snap["active"],q,min(target,available),allowed=(side,),minimum=20)
                 reason = "Opened paper position" if actual else "Entry thresholds or available depth insufficient"
+        due = now >= cadence_deadline(c, aid)
+        if due and actual is None and q:
+            quote_mid = (1 + q["YES"][0] - q["NO"][0]) / 2
+            actual, reason = timed_entry(c, a, q, snap.get("active", quote_mid), now)
         snap["reason"] = reason
         encoded = json.dumps(actual) if actual else None
         c.execute("""INSERT INTO observations(account,ticker,opened,close,snap,actual,epoch)
@@ -268,7 +316,6 @@ def learn(c, aid, model, snap, yes):
         promoted = rival["passed"] and rival_base["passed"]
         if promoted:
             model["active"] = model["frozen"]
-            model["active_name"] = f"Validated model {model['epoch']}"
         validated = promoted or incumbent["passed"]
         model["cap"] = min(50, model["cap"] + 10) if validated else 20
         model["last_review"] = dict(round=model["epoch"], promoted=promoted,
@@ -323,7 +370,10 @@ def cycle():
             return
     markets = market_feed(time.time())
     if markets:
-        chart = load_chart(time.time())
+        try:
+            chart = load_chart(time.time())
+        except (OSError, ValueError, KeyError):
+            chart = None
         for close,m in markets:
             m = complete_quotes(m)
             record(aid,m,close,time.time(),chart)

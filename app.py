@@ -3,6 +3,7 @@ import base64
 import csv
 import hmac
 import io
+import math
 import json
 import os
 import threading
@@ -68,8 +69,9 @@ def snapshot():
                                     AND result IS NOT NULL ORDER BY settled,id""", (aid,)):
             curve.append(round(curve[-1] + settled[0], 6))
         return dict(chart=chart,equity=curve,account=aid,cash=a["cash"],enabled=bool(a["enabled"]),status=a["reason"],age=ages,
+                    timed_entry_in=max(0, math.ceil(engine.cadence_deadline(c, aid) - time.time())),
                     today=engine.daily(c,aid,time.time()),daily_limit=engine.DAILY,
-                    cap=50,target=m["cap"],active=m["active_name"],seen=m["seen"],review=m["last_review"],
+                    cap=50,target=m["cap"],active=("60% chart forecast" if m["active"] is None else "60% chart forecast (validated calibration)"),seen=m["seen"],review=m["last_review"],
                     learning=(f"Forward test {m['epoch']} · {progress} of {BLOCK} markets"
                               if m["epoch"] else f"Initial training · {m['seen']} of {MIN_TRAIN} markets"),
                     positions=positions, open_count=open_count, max_positions=engine.MAX_POSITIONS,

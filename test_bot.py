@@ -19,12 +19,37 @@ import config
 
 class PaperTest(unittest.TestCase):
 
-    def test_inactivity_never_forces_a_trade(self):
-        q=dict(self.market,yes_ask_dollars=.48,no_ask_dollars=.54,yes_ask_size_fp=100,yes_bid_size_fp=100)
-        for delay in (0, 1800, 3600):
-            now = self.now + delay
-            e.record(1,q,now+300,now,None)
-        self.assertEqual(app.snapshot()["cash"],500)
+    def test_rolling_cadence_with_restart_and_risk_limits(self):
+        start = self.now
+        self.market.update(yes_ask_dollars=".51", no_ask_dollars=".51",
+                           yes_bid_size_fp="200", yes_ask_size_fp="200")
+
+        def record(t, ticker):
+            market = dict(self.market, ticker=ticker)
+            e.record(1, market, t + 500, t, None)
+
+        with e.db(True) as c:
+            c.execute("UPDATE cadence SET started=? WHERE account=1", (start,))
+        record(start + 1799, "first")
+        self.assertEqual(app.snapshot()["open_count"], 0)
+        e.init()
+        record(start + 1800, "first")
+        record(start + 1801, "first")
+        record(start + 3599, "second")
+        with e.db(True) as c:
+            rows = c.execute("SELECT actual FROM observations WHERE actual IS NOT NULL").fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertTrue(json.loads(rows[0][0])["timed"])
+            cash = e.account(c)["cash"]
+            self.assertAlmostEqual(500 - cash, json.loads(rows[0][0])["paid"])
+            c.execute("UPDATE v5_accounts SET cash=19")
+        record(start + 3600, "second")
+        with e.db(True) as c:
+            self.assertEqual(e.account(c)["cash"], 19)
+            c.execute("UPDATE v5_accounts SET cash=?", (cash,))
+        record(start + 3601, "second")
+        with e.db() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM observations WHERE actual IS NOT NULL").fetchone()[0], 2)
 
     def bars(self, now):
         end = int(now//300)*300
@@ -115,6 +140,18 @@ class PaperTest(unittest.TestCase):
             c.execute("UPDATE v5_accounts SET model=json_set(model,'$.seen',2)")
         e.init()
         self.assertEqual(app.snapshot()["seen"], 2)
+
+    def test_v4_label_with_chart_family_migrates(self):
+        model = dict(e.initial(), active_name="V4 baseline", active=[1.0]*5, seen=98)
+        with e.db(True) as c:
+            c.execute("UPDATE v5_accounts SET cash=345,enabled=0,model=?", (json.dumps(model),))
+        e.init()
+        state = app.snapshot()
+        self.assertEqual((state["cash"],state["seen"],state["active"]), (345,0,"60% chart forecast"))
+        self.assertFalse(state["enabled"])
+        self.assertIn(b"BTC candle model", app.HTML)
+        with e.db() as c:
+            self.assertIsNone(json.loads(e.account(c)["model"])["active"])
 
     def test_isolated_database(self):
         with patch.object(e,"BOT_ID","other"):
