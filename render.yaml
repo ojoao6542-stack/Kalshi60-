@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: kalshi-btc-paper-v5
+    runtime: python
+    plan: starter
+    buildCommand: python -m compileall -q app.py engine.py strategy.py
+    startCommand: python app.py
+    healthCheckPath: /health
+    disk:
+      name: v5-paper-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: V5_DB_PATH
+        value: /var/data/kalshi_v5.sqlite3
+      - key: DASHBOARD_PASSWORD
+        generateValue: true
+      - key: DAILY_LOSS_LIMIT
+        value: "250"
+      - key: HOST
+        value: 0.0.0.0
