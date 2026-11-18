@@ -11,15 +11,16 @@
 .plotbox output{font-size:13px;color:#bacbd0}
 .plotbox svg text{font:11px system-ui;fill:#afc4cb}
 </style></head><body><main>
-<header><small>BTC candle model · KXBTC15M</small><h1>60% probability paper bot</h1><p id="connection" role="status">Connecting to the worker…</p><div class="cards" id="cards"></div><p id="status"></p><p id="timer"></p><small id="market"></small></header>
+<header><small>BTC candle model · KXBTC15M</small><h1>60% probability paper bot</h1><p id="connection" role="status">Connecting to the worker…</p><div class="cards" id="cards"></div><p id="status"></p><small id="market"></small></header>
 <section><div class="chartrow"><h2>Kalshi YES price</h2></div>
 <div class="plotbox"><strong class="chartvalue" id="btcvalue">—</strong><output id="btclegend">Waiting for Kalshi quotes</output><svg id="btcplot" role="img" aria-label="YES midpoint in cents"></svg></div>
 <p id="chart"></p><small id="moves"></small></section>
 <section><h2>Paper account performance</h2><div class="plotbox"><strong class="chartvalue" id="eqvalue">—</strong><output id="eqlegend">Starting balance</output><svg id="eqplot" role="img" aria-label="Paper account balance by settled trade"></svg></div><small>Starts at $500. Updates when a trade settles.</small></section>
 <section><h2>Open positions</h2><p id="exposure"></p><div id="positions"></div></section>
-<section><h2>Entry rule</h2><p>Uses three hours of completed BTC candles. Regular entries require at least a 60% estimated win probability for the purchased side and more than one minute remaining. Minimum estimated edge is 12¢ per contract. Paper results exclude fees.</p></section>
+<section><h2>Entry rule</h2><p>Uses three hours of completed BTC candles. Regular entries require at least an 80% estimated win probability for the purchased side and more than one minute remaining. Minimum estimated edge is 12¢ per contract. Paper results exclude fees.</p></section>
+<section><h2>Forecast accuracy</h2><p id="forecast-progress"></p><p id="forecast-scores"></p><small>First valid forecast with 4:30–5:00 left. Lower Brier scores indicate better forecasts. Market uses the ask for the model’s favored side.</small><p><a href="/forecasts.csv">Download forecast history</a></p></section>
 <section><h2>Model and risk</h2><p id="learning"></p><p id="cap"></p><small id="review"></small></section>
-<section><h2>Recent trades</h2><div class="scroll"><table><thead><tr><th>Opened (UTC)</th><th>Side</th><th>Entry</th><th>Forecast</th><th>At risk</th><th>Result</th><th>P/L</th></tr></thead><tbody id="trades"></tbody></table></div><p id="empty"></p><a href="/trades.csv">Download trades, including archived accounts (CSV)</a></section>
+<section><small>Running rule · 80% confidence filter</small><p id="rule-results"></p><h2>Recent trades</h2><div class="scroll"><table><thead><tr><th>Opened (UTC)</th><th>Side</th><th>Entry</th><th>Forecast</th><th>At risk</th><th>Result</th><th>P/L</th></tr></thead><tbody id="trades"></tbody></table></div><p id="empty"></p><a href="/trades.csv">Download trades, including archived accounts (CSV)</a></section>
 <section><h2>Account controls</h2><p id="account"></p><button id="toggle" disabled>Pause</button> <button id="refresh">Refresh</button><p id="error" role="alert"></p><details><summary>Archive and reset</summary><p>Start a fresh $500 account and restart learning. Previous trades stay in the CSV. Pause first if a market is pending.</p><button id="reset" disabled>Archive and restart</button></details></section>
 </main><script>
 const el=id=>document.getElementById(id), usd=n=>n.toLocaleString("en-US",{style:"currency",currency:"USD"}), pct=n=>n==null?"—":n+"%";let state;
@@ -72,11 +73,13 @@ function paint(s){state=s;graphs(s);el("connection").textContent=(s.age===null?"
 el("cards").replaceChildren(...[["Available paper cash",usd(s.cash)],["Realized P/L",usd(s.all.net)],["Win rate",pct(s.all.rate)],["Settled trades",s.all.count]].map(([k,v])=>{let d=document.createElement("div");d.className="card";let l=document.createElement("small"),b=document.createElement("strong");l.textContent=k;b.textContent=v;d.append(l,b);return d}));
 el("chart").textContent=s.chart?s.chart.ticker+" · BTC target "+usd(s.chart.target):"";
 el("moves").textContent=s.chart?"YES ask "+(100*s.chart.yes).toFixed(1)+"¢ · NO ask "+(100*s.chart.no).toFixed(1)+"¢ · Chart shows YES midpoint":"";
-el("timer").textContent = !s.enabled ? "30-minute entries paused" : s.timed_entry_in > 0
-  ? "Next timed entry in " + Math.ceil(s.timed_entry_in / 60) + " min"
-  : "Timed entry due · waiting for an eligible fill";
 el("status").textContent=s.status;el("market").textContent=s.age===null?"":"Heartbeat "+s.age+"s ago";
 el("exposure").textContent=s.open_count+" of "+s.max_positions+" slots used · "+usd(s.reserved)+" at risk";el("positions").replaceChildren(...s.positions.map(r=>{let p=document.createElement("p");p.textContent=r.market+" · "+r.side+" · "+usd(r.risk)+" at risk";return p}));
+el("rule-results").textContent=s.current_rule.count+" settled under this rule · "+pct(s.current_rule.rate)+" win rate · "+usd(s.current_rule.net)+" paper P/L";
+const test=s.forecast_test;
+el("forecast-progress").textContent=test.watched+"/100 markets watched · "+test.captured+" forecasts captured · "+test.scored+" settled and scored";
+const labels={model_yes:"Original",market_yes:"Market",blend_yes:"50/50 blend"};
+el("forecast-scores").textContent=Object.entries(labels).map(([key,label])=>label+" "+(test.scores[key]?.toFixed(3)??"—")).join(" · ");
 el("learning").textContent="Forecast model: "+s.active+" · "+s.learning;el("cap").textContent="Paper trade range $20–"+usd(s.cap)+" · Current sizing target "+usd(s.target)+" · Daily loss limit "+usd(s.daily_limit)+" · Today (UTC) "+usd(s.today);
 let r=s.review;el("review").textContent=r?"Round "+r.round+" · "+(r.promoted?"Candidate promoted":"Current model retained")+" · Candidate paper P/L "+usd(r.rival.net)+" vs "+usd(r.rival.reference_net)+" at equal $20 budgets.":"The first comparison uses 40 new settled markets after 30 training markets.";
 rows("trades",s.recent.map(r=>[r.opened_utc,r.side+(r.entry_type==="30-minute"?" · 30-min":""),(100*r.price).toFixed(2)+"¢",Math.round(100*r.probability)+"%",usd(r.risk),r.result,r.pnl===null?"—":usd(r.pnl)]));

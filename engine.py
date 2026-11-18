@@ -1,5 +1,6 @@
 from config import BOT_ID
 from decimal import Decimal, ROUND_CEILING
+import forecast_test
 import json
 import logging
 import math
@@ -15,6 +16,8 @@ from urllib.parse import urlencode, quote, urlsplit
 from urllib.request import Request, urlopen
 
 from strategy import BLOCK, MIN_TRAIN, assess, entry, probability, chart_forecast, chart_side, chart_signal, update
+
+ENTRY_RULE = "80% confidence filter"
 
 API = "https://external-api.kalshi.com/trade-api/v2"
 PATH = os.getenv("PAPER_DB_PATH", BOT_ID + ".sqlite3")
@@ -63,10 +66,8 @@ def init():
         c.execute("""CREATE TABLE IF NOT EXISTS ticks(ticker TEXT, ts REAL, close REAL, target REAL,
                      yes REAL, no REAL, mid REAL, PRIMARY KEY(ticker,ts))""")
         c.execute("CREATE TABLE IF NOT EXISTS chart_cache(id INTEGER PRIMARY KEY, end INTEGER, forecast TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS cadence(account INTEGER PRIMARY KEY, started REAL NOT NULL)")
-        c.execute("""CREATE TRIGGER IF NOT EXISTS start_cadence AFTER INSERT ON v5_accounts
-                     BEGIN INSERT INTO cadence VALUES(NEW.id, strftime('%s','now')); END""")
-        c.execute("INSERT OR IGNORE INTO cadence SELECT id, ? FROM v5_accounts", (time.time(),))
+        forecast_test.init(c)
+        c.execute("DROP TRIGGER IF EXISTS start_cadence")
         c.execute("INSERT OR IGNORE INTO v5_accounts(id,model) VALUES(1,?)", (json.dumps(initial()),))
         current = account(c)
         model = json.loads(current["model"])
@@ -191,43 +192,16 @@ def load_chart(now):
     return chart
 
 
-def cadence_deadline(c, aid):
-    anchor = c.execute("""SELECT COALESCE(
-        (SELECT MAX(opened) FROM observations WHERE account=? AND actual IS NOT NULL),
-        (SELECT started FROM cadence WHERE account=?))""", (aid, aid)).fetchone()[0]
-    return anchor + 1800
-
-
-def cost(price, contracts):
-    return float(Decimal(str(price)) * contracts), 0
-
-
-def timed_entry(c, account_row, q, p_yes, now):
-    count, reserved = open_risk(c, account_row["id"])
-    budget = min(50, account_row["cash"], DAILY + daily(c, account_row["id"], now) - reserved)
-    if count >= MAX_POSITIONS or budget < 20:
-        return None, "30-minute entry waiting for paper risk budget"
-    candidates = []
-    for side, confidence in (("YES", p_yes), ("NO", 1 - p_yes)):
-        price, depth = q[side]
-        # Binary search for the smallest whole-contract fill reaching $20.
-        low, high = 1, min(depth, math.ceil(20 / price) + 1)
-        if high < 1:
-            continue
-        while low < high:
-            mid = (low + high) // 2
-            if cost(price, mid)[0] < 20:
-                low = mid + 1
-            else:
-                high = mid
-        paid, fee = cost(price, low)
-        if 20 <= paid <= budget:
-            order = dict(side=side, confidence=confidence, n=low, price=price,
-                         paid=paid, fee=fee, timed=True)
-            candidates.append((confidence - paid / low, confidence, order))
-    if not candidates:
-        return None, "30-minute entry waiting for enough quote depth or cash"
-    return max(candidates, key=lambda item: item[:2])[2], "Opened 30-minute paper entry"
+def sized_order(prob, quotes, target, available, allowed):
+    choices = []
+    for side in allowed:
+        price = Decimal(str(quotes[side][0]))
+        minimum_contracts = (Decimal(20) / price).to_integral_value(rounding=ROUND_CEILING)
+        budget = min(available, max(target, float(minimum_contracts * price)))
+        order = entry(prob,quotes,budget,allowed=(side,),minimum=20)
+        if order:
+            choices.append(order)
+    return max(choices,key=lambda o:o["confidence"]-o["price"],default=None)
 
 
 def record(aid, m, close, now, chart):
@@ -243,6 +217,14 @@ def record(aid, m, close, now, chart):
             c.execute("INSERT OR REPLACE INTO ticks VALUES(?,?,?,?,?,?,?)",
                       (ticker,now,close,float(m["floor_strike"]),q["YES"][0],q["NO"][0],mid))
         c.execute("DELETE FROM ticks WHERE close<?",(now-900,))
+        if forecast_test.due(c, aid, m["ticker"], close, now):
+            strike = float(m["floor_strike"])
+            pred = chart_signal(chart, chart["last_close"], strike, close-chart["end"]) if (
+                q and strike > 0 and chart and chart["end"] == int(now//300)*300) else None
+            if pred:
+                base, features = pred
+                model_yes = probability(base, json.loads(a["model"])["active"], features)
+                forecast_test.capture(c, aid, m["ticker"], now, q, model_yes, blend=True)
         if remaining <= 60:
             return note(c,aid,"Final minute · entries closed")
         prior = c.execute("SELECT actual,result FROM observations WHERE account=? AND ticker=?",(aid,ticker)).fetchone()
@@ -270,26 +252,24 @@ def record(aid, m, close, now, chart):
         if prediction:
             base, x = prediction
             snap.update(base=base, x=x)
+            count, reserved = open_risk(c, aid)
+            available = min(50, a["cash"], DAILY + daily(c,aid,now) - reserved)
+            allowed = (side,) if side else ()
             for label, weights in (("base", None), ("active", model["active"]), ("rival", model["frozen"])):
                 prob = probability(base, weights, x)
                 snap[label] = prob
-                snap[label+"_order"] = entry(prob,q,20,allowed=(side,))
-            count, reserved = open_risk(c, aid)
-            available = min(50, a["cash"], DAILY + daily(c,aid,now) - reserved)
-            if count >= MAX_POSITIONS or available < 20:
-                reason = "Waiting for available paper risk budget"
+                snap[label+"_order"] = sized_order(prob,q,20,available,allowed) if count < MAX_POSITIONS else None
+            if not allowed:
+                reason = "Waiting for the chart direction to agree with the target"
+            elif count >= MAX_POSITIONS or available < 20:
+                reason = "Waiting for available paper risk budget or daily loss allowance"
             else:
-                price = q[side][0]
-                unit = Decimal(str(price))
-                min_contracts = (Decimal(20) / unit).to_integral_value(rounding=ROUND_CEILING)
-                target = max(model["cap"], float(min_contracts * unit))
-                actual = entry(snap["active"],q,min(target,available),allowed=(side,),minimum=20)
+                actual = sized_order(snap["active"],q,model["cap"],available,allowed)
                 reason = "Opened paper position" if actual else "Entry thresholds or available depth insufficient"
-        due = now >= cadence_deadline(c, aid)
-        if due and actual is None and q:
-            quote_mid = (1 + q["YES"][0] - q["NO"][0]) / 2
-            actual, reason = timed_entry(c, a, q, snap.get("active", quote_mid), now)
+        snap["entry_rule"] = ENTRY_RULE
         snap["reason"] = reason
+        if actual:
+            actual["entry_rule"] = ENTRY_RULE
         encoded = json.dumps(actual) if actual else None
         c.execute("""INSERT INTO observations(account,ticker,opened,close,snap,actual,epoch)
                      VALUES(?,?,?,?,?,?,?)
@@ -305,8 +285,8 @@ def learn(c, aid, model, snap, yes):
     model["online"] = update(model["online"],model["seen"],snap["base"],snap["x"],yes)
     model["seen"] += 1
     if model["epoch"]:
-        raw = c.execute("""SELECT snap,result FROM observations WHERE account=? AND epoch=?
-                           AND json_extract(snap,'$.family')='candles_v1' AND json_extract(snap,'$.x') IS NOT NULL AND result IN ('YES','NO') ORDER BY id""",(aid,model["epoch"])).fetchall()
+        raw = c.execute("""SELECT snap,result FROM observations WHERE account=? AND epoch=? AND json_extract(snap,'$.entry_rule')=?
+                           AND json_extract(snap,'$.family')='candles_v1' AND json_extract(snap,'$.x') IS NOT NULL AND result IN ('YES','NO') ORDER BY id""",(aid,model["epoch"],ENTRY_RULE)).fetchall()
         if len(raw) < BLOCK:
             return
         rows = [dict(json.loads(r["snap"]), yes=int(r["result"]=="YES")) for r in raw]

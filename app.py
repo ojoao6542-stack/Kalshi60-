@@ -3,7 +3,6 @@ import base64
 import csv
 import hmac
 import io
-import math
 import json
 import os
 import threading
@@ -15,6 +14,7 @@ from http.cookies import SimpleCookie, CookieError
 from datetime import datetime, timezone
 
 import engine
+import forecast_test
 from config import DEFAULT_PORT
 from strategy import BLOCK, MIN_TRAIN
 
@@ -28,6 +28,7 @@ def utc(ts):
 def trade(r):
     o = json.loads(r["actual"])
     return dict(account=r["account"],market=r["ticker"],opened_utc=utc(r["opened"]),side=o["side"],
+                entry_rule=o.get("entry_rule","Earlier version"),
                 entry_type="30-minute" if o.get("timed") else "Strategy",
                 contracts=o["n"],price=o["price"],fee=o["fee"],risk=o["paid"],
                 probability=round(o["confidence"],4),result=r["result"] or "OPEN",pnl=r["pnl"])
@@ -54,8 +55,8 @@ def snapshot():
         closed=[r for r in rows if r["result"]!="OPEN"]
         open_count, reserved=engine.open_risk(c,aid)
         positions=[r for r in rows if r["result"]=="OPEN"]
-        progress=c.execute("SELECT COUNT(*) FROM observations WHERE account=? AND epoch=? AND json_extract(snap,'$.family')='candles_v1' AND json_extract(snap,'$.x') IS NOT NULL AND result IN ('YES','NO')",
-                           (aid,m["epoch"])).fetchone()[0]
+        progress=c.execute("SELECT COUNT(*) FROM observations WHERE account=? AND epoch=? AND json_extract(snap,'$.entry_rule')=? AND json_extract(snap,'$.family')='candles_v1' AND json_extract(snap,'$.x') IS NOT NULL AND result IN ('YES','NO')",
+                           (aid,m["epoch"],engine.ENTRY_RULE)).fetchone()[0]
         ages=None if a["heartbeat"] is None else int(time.time()-a["heartbeat"])
         latest = c.execute("SELECT * FROM ticks WHERE close>? AND ts>? ORDER BY ts DESC LIMIT 1",
                            (time.time(),time.time()-45)).fetchone()
@@ -68,8 +69,7 @@ def snapshot():
         for settled in c.execute("""SELECT pnl FROM observations WHERE account=? AND actual IS NOT NULL
                                     AND result IS NOT NULL ORDER BY settled,id""", (aid,)):
             curve.append(round(curve[-1] + settled[0], 6))
-        return dict(chart=chart,equity=curve,account=aid,cash=a["cash"],enabled=bool(a["enabled"]),status=a["reason"],age=ages,
-                    timed_entry_in=max(0, math.ceil(engine.cadence_deadline(c, aid) - time.time())),
+        return dict(current_rule=stats([r for r in closed if r["entry_rule"]==engine.ENTRY_RULE]),forecast_test=forecast_test.summary(c,aid),chart=chart,equity=curve,account=aid,cash=a["cash"],enabled=bool(a["enabled"]),status=a["reason"],age=ages,
                     today=engine.daily(c,aid,time.time()),daily_limit=engine.DAILY,
                     cap=50,target=m["cap"],active=("60% chart forecast" if m["active"] is None else "60% chart forecast (validated calibration)"),seen=m["seen"],review=m["last_review"],
                     learning=(f"Forward test {m['epoch']} · {progress} of {BLOCK} markets"
@@ -166,11 +166,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200,HTML,"text/html; charset=utf-8")
         if path=="/state":
             return self.reply(200,json.dumps(snapshot(),allow_nan=False).encode(),"application/json")
+        if path=="/forecasts.csv":
+            with engine.db() as c:
+                payload = forecast_test.export(c,engine.account(c)["id"])
+            return self.reply(200,payload,"text/csv",{"Content-Disposition":'attachment; filename="forecasts.csv"'})
         if path=="/trades.csv":
             with engine.db() as c:
                 rows=[trade(r) for r in c.execute("SELECT * FROM observations WHERE actual IS NOT NULL ORDER BY id")]
             out=io.StringIO()
-            fields="account market opened_utc side entry_type contracts price fee risk probability result pnl".split()
+            fields="account market opened_utc side entry_type contracts price fee risk probability result pnl entry_rule".split()
             writer=csv.DictWriter(out,fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)

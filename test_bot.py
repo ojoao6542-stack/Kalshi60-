@@ -19,7 +19,7 @@ import config
 
 class PaperTest(unittest.TestCase):
 
-    def test_rolling_cadence_with_restart_and_risk_limits(self):
+    def test_idle_account_waits_for_strategy_after_restart(self):
         start = self.now
         self.market.update(yes_ask_dollars=".51", no_ask_dollars=".51",
                            yes_bid_size_fp="200", yes_ask_size_fp="200")
@@ -28,32 +28,22 @@ class PaperTest(unittest.TestCase):
             market = dict(self.market, ticker=ticker)
             e.record(1, market, t + 500, t, None)
 
-        with e.db(True) as c:
-            c.execute("UPDATE cadence SET started=? WHERE account=1", (start,))
         record(start + 1799, "first")
-        self.assertEqual(app.snapshot()["open_count"], 0)
         e.init()
-        record(start + 1800, "first")
-        record(start + 1801, "first")
-        record(start + 3599, "second")
-        with e.db(True) as c:
-            rows = c.execute("SELECT actual FROM observations WHERE actual IS NOT NULL").fetchall()
-            self.assertEqual(len(rows), 1)
-            self.assertTrue(json.loads(rows[0][0])["timed"])
-            cash = e.account(c)["cash"]
-            self.assertAlmostEqual(500 - cash, json.loads(rows[0][0])["paid"])
-            c.execute("UPDATE v5_accounts SET cash=19")
-        record(start + 3600, "second")
-        with e.db(True) as c:
-            self.assertEqual(e.account(c)["cash"], 19)
-            c.execute("UPDATE v5_accounts SET cash=?", (cash,))
-        record(start + 3601, "second")
-        with e.db() as c:
-            self.assertEqual(c.execute("SELECT COUNT(*) FROM observations WHERE actual IS NOT NULL").fetchone()[0], 2)
+        record(start + 1801, "second")
+        record(start + 7200, "third")
+        state = app.snapshot()
+        self.assertEqual(state["open_count"], 0)
+        self.assertEqual(state["cash"], 500)
 
     def bars(self, now):
         end = int(now//300)*300
         return [[end-(36-i)*300,0,0,64000+i,64001+i,0] for i in range(36)]
+
+    def test_chosen_side_probability_floor(self):
+        q = {"YES":(.55,100),"NO":(.55,100)}
+        for side,p in (("YES",.7999),("NO",.2001)):
+            self.assertIsNone(s.entry(p,q,30,allowed=(side,),minimum=20))
 
     def setUp(self):
         temp = self.enterContext(tempfile.TemporaryDirectory())
@@ -64,15 +54,15 @@ class PaperTest(unittest.TestCase):
         self.close = self.now + 295
 
     def test_gross_edge_boundary_both_sides(self):
-        for side,yes in [("YES",.60),("NO",.40)]:
+        for side,yes in [("YES",.80),("NO",.20)]:
             q = {"YES":(.53,500),"NO":(.53,500)}
-            q[side] = (.48,500)
+            q[side] = (.68,500)
             o = s.entry(yes,q,50,allowed=(side,),minimum=20)
             self.assertEqual(o["fee"],0)
-            self.assertAlmostEqual(o["paid"],o["n"]*.48)
+            self.assertAlmostEqual(o["paid"],o["n"]*.68)
             self.assertLessEqual(o["paid"],50)
             self.assertGreaterEqual(o["paid"],20)
-            q[side] = (.481,500)
+            q[side] = (.681,500)
             self.assertIsNone(s.entry(yes,q,50,allowed=(side,),minimum=20))
         q = {"YES":(.40,100),"NO":(.61,100)}
         self.assertEqual(s.entry(.59,q,40) is None,not config.FIVE_MINUTES)
@@ -118,7 +108,7 @@ class PaperTest(unittest.TestCase):
     def test_time_window(self):
         q=dict(self.market,yes_ask_dollars=.48,no_ask_dollars=.54,yes_ask_size_fp=100,yes_bid_size_fp=100)
         chart=s.chart_forecast(self.bars(self.now),int(self.now//300)*300)
-        with patch.object(e,"chart_signal",return_value=(.65,[1,0,0,0,0])):
+        with patch.object(e,"chart_signal",return_value=(.85,[1,0,0,0,0])):
             e.record(1,q,self.now+301,self.now,chart)
             self.assertEqual(app.snapshot()["open_count"],0 if config.FIVE_MINUTES else 1)
             e.record(1,dict(q,ticker="KXBTC15M-LATE"),self.now+60,self.now,chart)
