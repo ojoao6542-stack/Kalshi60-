@@ -53,7 +53,7 @@ def snapshot():
         closed=[r for r in rows if r["result"]!="OPEN"]
         open_count, reserved=engine.open_risk(c,aid)
         positions=[r for r in rows if r["result"]=="OPEN"]
-        progress=c.execute("SELECT COUNT(*) FROM observations WHERE account=? AND epoch=? AND json_extract(snap,'$.x') IS NOT NULL AND result IN ('YES','NO')",
+        progress=c.execute("SELECT COUNT(*) FROM observations WHERE account=? AND epoch=? AND json_extract(snap,'$.family')='candles_v1' AND json_extract(snap,'$.x') IS NOT NULL AND result IN ('YES','NO')",
                            (aid,m["epoch"])).fetchone()[0]
         ages=None if a["heartbeat"] is None else int(time.time()-a["heartbeat"])
         latest = c.execute("SELECT * FROM ticks WHERE close>? AND ts>? ORDER BY ts DESC LIMIT 1",

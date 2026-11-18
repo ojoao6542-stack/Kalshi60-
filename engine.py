@@ -1,4 +1,4 @@
-from config import BOT_ID, FIVE_MINUTES
+from config import BOT_ID
 from decimal import Decimal, ROUND_CEILING
 import json
 import logging
@@ -14,7 +14,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode, quote, urlsplit
 from urllib.request import Request, urlopen
 
-from strategy import BLOCK, MIN_TRAIN, assess, entry, probability, forecast, update
+from strategy import BLOCK, MIN_TRAIN, assess, entry, probability, chart_forecast, chart_side, chart_signal, update
 
 API = "https://external-api.kalshi.com/trade-api/v2"
 PATH = os.getenv("PAPER_DB_PATH", BOT_ID + ".sqlite3")
@@ -39,7 +39,7 @@ def db(write=False):
 
 def initial():
     return dict(seen=0, online=[0.0]*5, active=None, frozen=None, epoch=0, cap=20,
-                active_name="Kalshi quote baseline", last_review=None)
+                family="candles_v1", active_name="60% chart forecast", last_review=None)
 
 
 def init():
@@ -62,11 +62,12 @@ def init():
             UNIQUE(account,ticker))""")
         c.execute("""CREATE TABLE IF NOT EXISTS ticks(ticker TEXT, ts REAL, close REAL, target REAL,
                      yes REAL, no REAL, mid REAL, PRIMARY KEY(ticker,ts))""")
-        c.execute("CREATE TABLE IF NOT EXISTS cadence(account INTEGER PRIMARY KEY, started REAL NOT NULL)")
-        c.execute("""CREATE TRIGGER IF NOT EXISTS start_cadence AFTER INSERT ON v5_accounts
-                     BEGIN INSERT INTO cadence VALUES(NEW.id, strftime('%s','now')); END""")
-        c.execute("INSERT OR IGNORE INTO cadence SELECT id, ? FROM v5_accounts", (time.time(),))
+        c.execute("CREATE TABLE IF NOT EXISTS chart_cache(id INTEGER PRIMARY KEY, end INTEGER, forecast TEXT)")
+        c.execute("DROP TRIGGER IF EXISTS start_cadence")
         c.execute("INSERT OR IGNORE INTO v5_accounts(id,model) VALUES(1,?)", (json.dumps(initial()),))
+        current = account(c)
+        if json.loads(current["model"]).get("family") != "candles_v1":
+            c.execute("UPDATE v5_accounts SET model=? WHERE id=?", (json.dumps(initial()), current["id"]))
 
 
 def account(c):
@@ -166,46 +167,26 @@ def open_risk(c, aid):
     return row[0], row[1]
 
 
-def cadence_due(c, aid, now):
-    anchor = c.execute("""SELECT COALESCE(
-        (SELECT MAX(opened) FROM observations WHERE account=? AND actual IS NOT NULL),
-        (SELECT started FROM cadence WHERE account=?))""", (aid, aid)).fetchone()[0]
-    return now >= anchor + 1800
+def load_chart(now):
+    end = int(now // 300) * 300
+    with db() as c:
+        row = c.execute("SELECT forecast FROM chart_cache WHERE id=1 AND end=?", (end,)).fetchone()
+    if row:
+        cached = json.loads(row[0])
+        if cached.pop("prices", None) and "last_close" in cached:
+            return cached
+    url = "https://api.exchange.coinbase.com/products/BTC-USD" + "/candles?" + urlencode(dict(
+        granularity=300, start=datetime.fromtimestamp(end-10800,timezone.utc).isoformat(),
+        end=datetime.fromtimestamp(end,timezone.utc).isoformat()))
+    chart = chart_forecast(get(url), end)
+    if chart:
+        with db(True) as c:
+            c.execute("INSERT OR REPLACE INTO chart_cache VALUES(1,?,?)",(end,json.dumps(chart)))
+        chart.pop("prices", None)
+    return chart
 
 
-def cost(price, contracts):
-    return float(Decimal(str(price)) * contracts), 0
-
-
-def timed_entry(c, account_row, q, p_yes, now):
-    count, reserved = open_risk(c, account_row["id"])
-    budget = min(50, account_row["cash"], DAILY + daily(c, account_row["id"], now) - reserved)
-    if count >= MAX_POSITIONS or budget < 20:
-        return None, "30-minute entry waiting for paper risk budget"
-    candidates = []
-    for side, confidence in (("YES", p_yes), ("NO", 1 - p_yes)):
-        price, depth = q[side]
-        # Binary search for the smallest whole-contract fill reaching $20.
-        low, high = 1, min(depth, math.ceil(20 / price) + 1)
-        if high < 1:
-            continue
-        while low < high:
-            mid = (low + high) // 2
-            if cost(price, mid)[0] < 20:
-                low = mid + 1
-            else:
-                high = mid
-        paid, fee = cost(price, low)
-        if 20 <= paid <= budget:
-            order = dict(side=side, confidence=confidence, n=low, price=price,
-                         paid=paid, fee=fee, timed=True)
-            candidates.append((confidence - paid / low, confidence, order))
-    if not candidates:
-        return None, "30-minute entry waiting for enough quote depth or cash"
-    return max(candidates, key=lambda item: item[:2])[2], "Opened 30-minute paper entry"
-
-
-def record(aid, m, close, now):
+def record(aid, m, close, now, chart):
     ticker = m["ticker"]
     q = quotes(m)
     remaining = close - now
@@ -218,21 +199,29 @@ def record(aid, m, close, now):
             c.execute("INSERT OR REPLACE INTO ticks VALUES(?,?,?,?,?,?,?)",
                       (ticker,now,close,float(m["floor_strike"]),q["YES"][0],q["NO"][0],mid))
         c.execute("DELETE FROM ticks WHERE close<?",(now-900,))
-        due = cadence_due(c, aid, now)
-        outside_window = FIVE_MINUTES and not 270 <= remaining <= 300
-        if outside_window and not due:
-            return note(c,aid,"Waiting for next five-minute decision window")
         if remaining <= 60:
             return note(c,aid,"Final minute · entries closed")
         prior = c.execute("SELECT actual,result FROM observations WHERE account=? AND ticker=?",(aid,ticker)).fetchone()
-        if prior and ((FIVE_MINUTES and not due) or prior["actual"] or prior["result"]):
+        if prior and (prior["actual"] or prior["result"]):
             return note(c,aid,"Decision recorded for this contract")
-        history = c.execute("SELECT ts,mid FROM ticks WHERE ticker=? AND ts BETWEEN ? AND ? ORDER BY ts",
-                            (ticker,now-90,now)).fetchall()
         model = json.loads(a["model"])
-        prediction = forecast(history,q,remaining) if q else None
-        reason = "Collecting recent Kalshi quotes" if q else "Waiting for a valid two-sided Kalshi quote"
-        snap = dict(strategy=BOT_ID, quotes=q, seconds=remaining)
+        current = chart and chart["end"] == int(now//300)*300
+        strike = float(m["floor_strike"])
+        prediction = None
+        if not current:
+            reason = "Waiting for a complete three-hour BTC chart"
+        elif not q:
+            reason = "Waiting for a valid Kalshi quote"
+        elif not math.isfinite(strike) or strike <= 0:
+            reason = "Waiting for a valid Kalshi target"
+        else:
+            spot = chart["last_close"]
+            horizon = remaining + now - chart["end"]
+            side = chart_side(chart, spot, strike, horizon)
+            reason = "Waiting for a chart trend that agrees with the contract target"
+            if side:
+                prediction = chart_signal(chart, spot, strike, horizon)
+        snap = dict(strategy=BOT_ID, family=model["family"], quotes=q, seconds=remaining)
         actual = None
         if prediction:
             base, x = prediction
@@ -240,27 +229,18 @@ def record(aid, m, close, now):
             for label, weights in (("base", None), ("active", model["active"]), ("rival", model["frozen"])):
                 prob = probability(base, weights, x)
                 snap[label] = prob
-                snap[label+"_order"] = entry(prob,q,20)
+                snap[label+"_order"] = entry(prob,q,20,allowed=(side,))
             count, reserved = open_risk(c, aid)
             available = min(50, a["cash"], DAILY + daily(c,aid,now) - reserved)
             if count >= MAX_POSITIONS or available < 20:
                 reason = "Waiting for available paper risk budget"
             else:
-                choices = []
-                for side in ("YES","NO"):
-                    price = q[side][0]
-                    unit = Decimal(str(price))
-                    min_contracts = (Decimal(20) / unit).to_integral_value(rounding=ROUND_CEILING)
-                    target = max(model["cap"], float(min_contracts * unit))
-                    order = entry(snap["active"],q,min(target,available),allowed=(side,),minimum=20)
-                    if order:
-                        choices.append(order)
-                if choices and not outside_window and not (FIVE_MINUTES and prior):
-                    actual = max(choices,key=lambda o:o["confidence"] - o["paid"]/o["n"])
+                price = q[side][0]
+                unit = Decimal(str(price))
+                min_contracts = (Decimal(20) / unit).to_integral_value(rounding=ROUND_CEILING)
+                target = max(model["cap"], float(min_contracts * unit))
+                actual = entry(snap["active"],q,min(target,available),allowed=(side,),minimum=20)
                 reason = "Opened paper position" if actual else "Entry thresholds or available depth insufficient"
-        if due and actual is None and q:
-            quote_mid = (1 + q["YES"][0] - q["NO"][0]) / 2
-            actual, reason = timed_entry(c, a, q, snap.get("active", quote_mid), now)
         snap["reason"] = reason
         encoded = json.dumps(actual) if actual else None
         c.execute("""INSERT INTO observations(account,ticker,opened,close,snap,actual,epoch)
@@ -278,7 +258,7 @@ def learn(c, aid, model, snap, yes):
     model["seen"] += 1
     if model["epoch"]:
         raw = c.execute("""SELECT snap,result FROM observations WHERE account=? AND epoch=?
-                           AND json_extract(snap,'$.x') IS NOT NULL AND result IN ('YES','NO') ORDER BY id""",(aid,model["epoch"])).fetchall()
+                           AND json_extract(snap,'$.family')='candles_v1' AND json_extract(snap,'$.x') IS NOT NULL AND result IN ('YES','NO') ORDER BY id""",(aid,model["epoch"])).fetchall()
         if len(raw) < BLOCK:
             return
         rows = [dict(json.loads(r["snap"]), yes=int(r["result"]=="YES")) for r in raw]
@@ -311,8 +291,9 @@ def settle(aid, oid, result, value, now):
         pnl = round(payout-order["paid"],6) if order else None
         c.execute("UPDATE observations SET settled=?,result=?,pnl=? WHERE id=?",(now,result,pnl,oid))
         model = json.loads(a["model"])
-        if result in ("YES","NO") and "x" in json.loads(r["snap"]):
-            learn(c,aid,model,json.loads(r["snap"]),int(result=="YES"))
+        snap = json.loads(r["snap"])
+        if result in ("YES","NO") and snap.get("family") == model["family"] and "x" in snap:
+            learn(c,aid,model,snap,int(result=="YES"))
         c.execute("UPDATE v5_accounts SET cash=cash+?,model=? WHERE id=?", (payout,json.dumps(model),aid))
 
 
@@ -342,9 +323,10 @@ def cycle():
             return
     markets = market_feed(time.time())
     if markets:
+        chart = load_chart(time.time())
         for close,m in markets:
             m = complete_quotes(m)
-            record(aid,m,close,time.time())
+            record(aid,m,close,time.time(),chart)
     else:
         with db(True) as c:
             note(c,aid,"Waiting for an open BTC market")

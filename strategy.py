@@ -28,18 +28,52 @@ def update(weights, seen, base, x, yes):
             for w, v in zip(weights, x)]
 
 
-def forecast(history, quotes, remaining):
-    """Experimental continuation of the current contract's quote momentum."""
-    if len(history) < 4:
+def chart_signal(chart, spot, strike, seconds):
+    horizon = seconds / 300
+    rms = chart["rms"]
+    if rms <= 0:
         return None
-    elapsed = history[-1][0] - history[0][0]
-    if elapsed < 30 or any(b[0]-a[0] > 40 for a,b in zip(history,history[1:])):
+    drift = chart["drift"]
+    distance = (math.log(spot / strike) + drift * horizon) / (rms * math.sqrt(horizon))
+    chance = clamp((1 + math.erf(distance / math.sqrt(2))) / 2, .01, .99)
+    return chance, [1., clamp(distance, -3, 3), drift / rms,
+                    clamp(chart["recent"] / rms, -3, 3), seconds / 900]
+
+
+def chart_forecast(candles, end):
+    """Three hours of consecutive finalized five-minute bars, as known at end."""
+    bars = {}
+    for row in candles:
+        ts = int(row[0])
+        if ts < end - 10800 or ts >= end:
+            continue
+        op, close = float(row[3]), float(row[4])
+        if all(math.isfinite(v) and v > 0 for v in (op, close)):
+            bars[ts] = (op, close)
+    required = range(end - 10800, end, 300)
+    if any(t not in bars for t in required):
         return None
-    mid = history[-1][1]
-    move = mid-history[0][1]
-    drift = clamp(move * min(remaining,120) / elapsed,-.20,.20)
-    spread = quotes["YES"][0]+quotes["NO"][0]-1
-    return clamp(mid+drift,.01,.99), [1.,2*mid-1,clamp(5*move,-1,1),10*spread,remaining/900]
+    prices = [bars[end - 10800][0]] + [bars[t][1] for t in required]
+    moves = [math.log(b/a) for a,b in zip(prices,prices[1:])]
+    rms = math.sqrt(sum(v*v for v in moves)/36)
+    returns = [math.log(prices[-1]/prices[-1-n]) for n in (3,12,36)]
+    # Trend-continuation estimate per five minutes, capped for sudden moves.
+    drift = sum(w*r/n for w,r,n in zip((0.5,0.3,0.2),returns,(3,12,36)))
+    drift = clamp(drift, -0.5*rms, 0.5*rms)
+    direction = "MIXED"
+    if rms > 0 and abs(drift) >= 0.10*rms and drift*returns[0] > 0:
+        direction = "UP" if drift > 0 else "DOWN"
+    return dict(end=end, last_close=prices[-1], rms=rms, recent=returns[0]/3, direction=direction, drift=drift, prices=prices,
+                changes=[round(100*math.expm1(v),3) for v in returns])
+
+
+def chart_side(chart, spot, strike, seconds):
+    projected = spot * math.exp(chart["drift"]*seconds/300)
+    if chart["direction"] == "UP" and projected >= strike:
+        return "YES"
+    if chart["direction"] == "DOWN" and projected < strike:
+        return "NO"
+    return None
 
 
 def entry(p_yes, quotes, cap, allowed=("YES","NO"), minimum=0):

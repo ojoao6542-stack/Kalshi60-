@@ -19,36 +19,16 @@ import config
 
 class PaperTest(unittest.TestCase):
 
-    def test_rolling_cadence_with_restart_and_risk_limits(self):
-        start = self.now
-        self.market.update(yes_ask_dollars=".51", no_ask_dollars=".51",
-                           yes_bid_size_fp="200", yes_ask_size_fp="200")
+    def test_inactivity_never_forces_a_trade(self):
+        q=dict(self.market,yes_ask_dollars=.48,no_ask_dollars=.54,yes_ask_size_fp=100,yes_bid_size_fp=100)
+        for delay in (0, 1800, 3600):
+            now = self.now + delay
+            e.record(1,q,now+300,now,None)
+        self.assertEqual(app.snapshot()["cash"],500)
 
-        def record(t, ticker):
-            market = dict(self.market, ticker=ticker)
-            e.record(1, market, t + 500, t)
-
-        with e.db(True) as c:
-            c.execute("UPDATE cadence SET started=? WHERE account=1", (start,))
-        record(start + 1799, "first")
-        e.init()
-        record(start + 1800, "first")
-        record(start + 1801, "first")
-        record(start + 3599, "second")
-        with e.db(True) as c:
-            rows = c.execute("SELECT actual FROM observations WHERE actual IS NOT NULL").fetchall()
-            self.assertEqual(len(rows), 1)
-            self.assertTrue(json.loads(rows[0][0])["timed"])
-            cash = e.account(c)["cash"]
-            self.assertAlmostEqual(500 - cash, json.loads(rows[0][0])["paid"])
-            c.execute("UPDATE v5_accounts SET cash=19")
-        record(start + 3600, "second")
-        with e.db(True) as c:
-            self.assertEqual(e.account(c)["cash"], 19)
-            c.execute("UPDATE v5_accounts SET cash=?", (cash,))
-        record(start + 3601, "second")
-        with e.db() as c:
-            self.assertEqual(c.execute("SELECT COUNT(*) FROM observations WHERE actual IS NOT NULL").fetchone()[0], 2)
+    def bars(self, now):
+        end = int(now//300)*300
+        return [[end-(36-i)*300,0,0,64000+i,64001+i,0] for i in range(36)]
 
     def setUp(self):
         temp = self.enterContext(tempfile.TemporaryDirectory())
@@ -79,6 +59,8 @@ class PaperTest(unittest.TestCase):
         def iso(t):
             return datetime.fromtimestamp(t,timezone.utc).isoformat()
         def feed(url):
+            if "/candles?" in url:
+                return self.bars(now)
             self.assertTrue(url.startswith(e.API+"/markets"))
             if "/markets?" in url:
                 return {"markets":[dict(self.market,open_time=iso(self.close-900),close_time=iso(self.close))]}
@@ -95,7 +77,7 @@ class PaperTest(unittest.TestCase):
             self.assertEqual(state["open_count"],1)
             order = state["recent"][0]
             self.assertEqual(order["side"],"YES")
-            self.assertAlmostEqual(state["cash"],500-order["contracts"]*.48)
+            self.assertAlmostEqual(state["cash"],500-order["contracts"]*order["price"])
             e.cycle()
             self.assertEqual(app.snapshot()["cash"],state["cash"])
             now=self.close+1
@@ -104,19 +86,35 @@ class PaperTest(unittest.TestCase):
             settled=app.snapshot()
             self.assertIsNone(settled["chart"])
             self.assertEqual(settled["seen"],1)
-            self.assertAlmostEqual(settled["cash"],500+order["contracts"]*.52)
+            self.assertAlmostEqual(settled["cash"],500+order["contracts"]*(1-order["price"]))
             e.cycle()
             self.assertEqual(app.snapshot()["cash"],settled["cash"])
 
     def test_time_window(self):
         q=dict(self.market,yes_ask_dollars=.48,no_ask_dollars=.54,yes_ask_size_fp=100,yes_bid_size_fp=100)
-        with patch.object(e,"forecast",return_value=(.65,[1,0,0,0,0])):
-            e.record(1,q,self.now+301,self.now)
+        chart=s.chart_forecast(self.bars(self.now),int(self.now//300)*300)
+        with patch.object(e,"chart_signal",return_value=(.65,[1,0,0,0,0])):
+            e.record(1,q,self.now+301,self.now,chart)
             self.assertEqual(app.snapshot()["open_count"],0 if config.FIVE_MINUTES else 1)
-            e.record(1,dict(q,ticker="KXBTC15M-LATE"),self.now+60,self.now)
+            e.record(1,dict(q,ticker="KXBTC15M-LATE"),self.now+60,self.now,chart)
             self.assertEqual(app.snapshot()["open_count"],0 if config.FIVE_MINUTES else 1)
-            e.record(1,q,self.now+270,self.now)
+            e.record(1,q,self.now+270,self.now,chart)
             self.assertEqual(app.snapshot()["open_count"],1)
+
+    def test_existing_account_upgrades_once(self):
+        with e.db(True) as c:
+            legacy = e.initial()
+            legacy.pop("family")
+            legacy.update(seen=90, cap=50, active_name="Kalshi quote baseline")
+            c.execute("UPDATE v5_accounts SET cash=321, model=?", (json.dumps(legacy),))
+        e.init()
+        state = app.snapshot()
+        self.assertEqual((state["cash"],state["seen"],state["target"]), (321,0,20))
+        self.assertEqual(state["active"], "60% chart forecast")
+        with e.db(True) as c:
+            c.execute("UPDATE v5_accounts SET model=json_set(model,'$.seen',2)")
+        e.init()
+        self.assertEqual(app.snapshot()["seen"], 2)
 
     def test_isolated_database(self):
         with patch.object(e,"BOT_ID","other"):
