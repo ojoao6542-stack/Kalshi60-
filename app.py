@@ -14,7 +14,8 @@ from http.cookies import SimpleCookie, CookieError
 from datetime import datetime, timezone
 
 import engine
-from strategy import BLOCK, CONFIDENCE, MIN_TRAIN
+from config import DEFAULT_PORT
+from strategy import BLOCK, MIN_TRAIN
 
 HTML = Path(__file__).with_name("dashboard.html").read_bytes()
 
@@ -26,6 +27,7 @@ def utc(ts):
 def trade(r):
     o = json.loads(r["actual"])
     return dict(account=r["account"],market=r["ticker"],opened_utc=utc(r["opened"]),side=o["side"],
+                entry_type="30-minute" if o.get("timed") else "Strategy",
                 contracts=o["n"],price=o["price"],fee=o["fee"],risk=o["paid"],
                 probability=round(o["confidence"],4),result=r["result"] or "OPEN",pnl=r["pnl"])
 
@@ -49,22 +51,29 @@ def snapshot():
         m=json.loads(a["model"])
         rows=[trade(r) for r in c.execute("SELECT * FROM observations WHERE account=? AND actual IS NOT NULL ORDER BY id",(aid,))]
         closed=[r for r in rows if r["result"]!="OPEN"]
-        # Use full precision for inclusion at the boundary.
-        filtered=[trade(r) for r in c.execute("""SELECT * FROM observations WHERE account=? AND result IS NOT NULL
-            AND actual IS NOT NULL AND json_extract(actual,'$.confidence')>=? ORDER BY id""",(aid,CONFIDENCE))]
         open_count, reserved=engine.open_risk(c,aid)
         positions=[r for r in rows if r["result"]=="OPEN"]
-        progress=c.execute("SELECT COUNT(*) FROM observations WHERE account=? AND epoch=? AND result IN ('YES','NO')",
+        progress=c.execute("SELECT COUNT(*) FROM observations WHERE account=? AND epoch=? AND json_extract(snap,'$.x') IS NOT NULL AND result IN ('YES','NO')",
                            (aid,m["epoch"])).fetchone()[0]
         ages=None if a["heartbeat"] is None else int(time.time()-a["heartbeat"])
-        cached=c.execute("SELECT forecast FROM chart_cache WHERE id=1 AND end=?", (int(time.time()//300)*300,)).fetchone()
-        return dict(chart=json.loads(cached[0]) if cached else None,account=aid,cash=a["cash"],enabled=bool(a["enabled"]),status=a["reason"],age=ages,
-                    btc=a["btc"],today=engine.daily(c,aid,time.time()),daily_limit=engine.DAILY,
-                    cap=m["cap"],active=m["active_name"],seen=m["seen"],review=m["last_review"],
+        latest = c.execute("SELECT * FROM ticks WHERE close>? AND ts>? ORDER BY ts DESC LIMIT 1",
+                           (time.time(),time.time()-45)).fetchone()
+        chart = None
+        if latest:
+            chart = dict(latest)
+            points = c.execute("SELECT ts,mid FROM ticks WHERE ticker=? ORDER BY ts",(latest["ticker"],))
+            chart["points"] = [list(row) for row in points]
+        curve = [500.0]
+        for settled in c.execute("""SELECT pnl FROM observations WHERE account=? AND actual IS NOT NULL
+                                    AND result IS NOT NULL ORDER BY settled,id""", (aid,)):
+            curve.append(round(curve[-1] + settled[0], 6))
+        return dict(chart=chart,equity=curve,account=aid,cash=a["cash"],enabled=bool(a["enabled"]),status=a["reason"],age=ages,
+                    today=engine.daily(c,aid,time.time()),daily_limit=engine.DAILY,
+                    cap=50,target=m["cap"],active=m["active_name"],seen=m["seen"],review=m["last_review"],
                     learning=(f"Forward test {m['epoch']} · {progress} of {BLOCK} markets"
                               if m["epoch"] else f"Initial training · {m['seen']} of {MIN_TRAIN} markets"),
                     positions=positions, open_count=open_count, max_positions=engine.MAX_POSITIONS,
-                    reserved=reserved, all=stats(closed), filtered=stats(filtered),
+                    reserved=reserved, all=stats(closed),
                     recent=rows[-30:][::-1],archives=aid-1)
 
 
@@ -159,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
             with engine.db() as c:
                 rows=[trade(r) for r in c.execute("SELECT * FROM observations WHERE actual IS NOT NULL ORDER BY id")]
             out=io.StringIO()
-            fields="account market opened_utc side contracts price fee risk probability result pnl".split()
+            fields="account market opened_utc side entry_type contracts price fee risk probability result pnl".split()
             writer=csv.DictWriter(out,fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
@@ -202,7 +211,7 @@ def main():
     if host not in ("127.0.0.1","localhost","::1") and not os.getenv("DASHBOARD_PASSWORD"):
         raise SystemExit("Set DASHBOARD_PASSWORD to run on a public interface.")
     engine.init()
-    server=ThreadingHTTPServer((host,int(os.getenv("PORT","8501"))),Handler)
+    server=ThreadingHTTPServer((host,int(os.getenv("PORT",DEFAULT_PORT))),Handler)
     stop=threading.Event()
     threading.Thread(target=engine.worker,args=(stop,),daemon=True).start()
     try:

@@ -1,26 +1,82 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>BTC Paper Trader · V5</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#101a21;color:#f3f0e8;font:16px/1.5 Inter,-apple-system,BlinkMacSystemFont,sans-serif}main{max-width:900px;margin:auto;padding:32px 18px 60px}header,section{border-top:1px solid #41505a;padding:20px 0}header{border-top:4px solid #91e1b8}h1,h2,p{margin:0 0 10px}h1{font-size:clamp(28px,6vw,48px);line-height:1.15}h2{font-size:20px}small,th,label{color:#b4c4c8}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}.card{border:1px solid #40505a;border-radius:8px;padding:12px}.card strong{display:block;font-size:23px;color:#a6efd0;font-variant-numeric:tabular-nums}button,a{font:inherit;color:#b6f2d6}button{border:1px solid #607d78;background:#20382f;padding:8px 14px;border-radius:6px;cursor:pointer}summary{cursor:pointer}table{border-collapse:collapse;width:100%;white-space:nowrap}td,th{padding:8px 10px;text-align:left;border-bottom:1px solid #35434c}th{font-weight:500}.scroll{overflow-x:auto}#error{color:#ffbca8}strong{font-variant-numeric:tabular-nums}details p{margin-top:10px}@media(max-width:600px){.cards{grid-template-columns:repeat(2,1fr)}main{padding-top:18px}}
+
+.plotbox{background:#15252d;border:1px solid #34464f;border-radius:12px;padding:14px;margin:10px 0 7px}
+.plotbox svg{width:100%;height:145px;display:block;touch-action:pan-y}
+.chartrow{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.chartrow h2{margin:0}.range button{font-size:13px;padding:5px 10px;background:transparent;border-color:#435b64;color:#becdd1}
+.range button[aria-pressed=true]{color:#102029;background:#b2e7da}
+.chartvalue{display:block;font-size:22px;line-height:1.2;font-weight:650;margin:4px 0}
+.plotbox output{font-size:13px;color:#bacbd0}
+.plotbox svg text{font:11px system-ui;fill:#afc4cb}
 </style></head><body><main>
-<header><small>V5 / KXBTC15M</small><h1>Bitcoin paper trader</h1><p id="connection" role="status">Connecting to the worker…</p><div class="cards" id="cards"></div><p id="status"></p><small id="market"></small></header>
-<section><h2>Bitcoin chart forecast</h2><p id="chart"></p><small id="moves"></small></section>
+<header><small>V5 / KXBTC15M</small><h1>60% probability paper bot</h1><p id="connection" role="status">Connecting to the worker…</p><div class="cards" id="cards"></div><p id="status"></p><small id="market"></small></header>
+<section><div class="chartrow"><h2>Kalshi YES price</h2></div>
+<div class="plotbox"><strong class="chartvalue" id="btcvalue">—</strong><output id="btclegend">Waiting for Kalshi quotes</output><svg id="btcplot" role="img" aria-label="YES midpoint in cents"></svg></div>
+<p id="chart"></p><small id="moves"></small></section>
+<section><h2>Paper account performance</h2><div class="plotbox"><strong class="chartvalue" id="eqvalue">—</strong><output id="eqlegend">Starting balance</output><svg id="eqplot" role="img" aria-label="Paper account balance by settled trade"></svg></div><small>Starts at $500. Updates when a trade settles.</small></section>
 <section><h2>Open positions</h2><p id="exposure"></p><div id="positions"></div></section>
+<section><h2>Entry rule</h2><p>Requires at least a 60% estimated win probability for the purchased side and more than one minute remaining. Minimum estimated edge is 12¢ per contract. Paper results exclude fees.</p></section>
 <section><h2>Model and risk</h2><p id="learning"></p><p id="cap"></p><small id="review"></small></section>
-<section><h2>60% filter experiment</h2><p>Settled paper trades whose predicted chance of winning was at least 60%, compared with all settled trades at their original sizes.</p><div class="scroll"><table><thead><tr><th>Strategy</th><th>Trades</th><th>Win rate</th><th>Net P/L</th><th>Max drawdown</th></tr></thead><tbody id="shadow"></tbody></table></div></section>
 <section><h2>Recent trades</h2><div class="scroll"><table><thead><tr><th>Opened (UTC)</th><th>Side</th><th>Entry</th><th>Forecast</th><th>At risk</th><th>Result</th><th>P/L</th></tr></thead><tbody id="trades"></tbody></table></div><p id="empty"></p><a href="/trades.csv">Download trades, including archived accounts (CSV)</a></section>
 <section><h2>Account controls</h2><p id="account"></p><button id="toggle" disabled>Pause</button> <button id="refresh">Refresh</button><p id="error" role="alert"></p><details><summary>Archive and reset</summary><p>Start a fresh $500 account and restart learning. Previous trades stay in the CSV. Pause first if a market is pending.</p><button id="reset" disabled>Archive and restart</button></details></section>
 </main><script>
 const el=id=>document.getElementById(id), usd=n=>n.toLocaleString("en-US",{style:"currency",currency:"USD"}), pct=n=>n==null?"—":n+"%";let state;
+
+const clock=ts=>new Date(ts*1000).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"});
+function draw(id, values, labels, color, step, empty){
+  const svg=el(id+"plot"), value=el(id+"value"), legend=el(id+"legend");
+  svg.replaceChildren();svg.onpointermove=svg.onpointerdown=svg.onpointerleave=null;
+  if(!values.length){svg.style.display="none";value.textContent="—";legend.textContent=empty;return}
+  svg.style.display="block";
+  const w=Math.max(230,svg.clientWidth), h=145, left=59,right=w-7,top=13,bottom=118;
+  svg.setAttribute("viewBox",`0 0 ${w} ${h}`);
+  function add(tag, attrs, content){
+    const node=document.createElementNS("http://www.w3.org/2000/svg",tag);
+    Object.entries(attrs).forEach(([k,v])=>node.setAttribute(k,v));
+    if(content!==undefined)node.textContent=content;svg.append(node);return node;
+  }
+  let lo=Infinity,hi=-Infinity;
+  for(const v of values){lo=Math.min(lo,v);hi=Math.max(hi,v)}
+  const pad=Math.max((hi-lo)*0.08,step?0.5:1);lo-=pad;hi+=pad;
+  const x=i=>left+(right-left)*i/Math.max(1,values.length-1);
+  const y=v=>bottom-(bottom-top)*(v-lo)/(hi-lo);
+  for(let i=0;i<3;i++){
+    const v=lo+(hi-lo)*i/2;
+    add("line",{x1:left,x2:right,y1:y(v),y2:y(v),stroke:"#395058"});
+    add("text",{x:left-6,y:y(v)+4,"text-anchor":"end"},(step?usd(v):v.toFixed(1)+"¢"));
+  }
+  let line="M"+x(0)+" "+y(values[0]);
+  for(let i=1;i<values.length;i++)line+=step?" H"+x(i)+" V"+y(values[i]):" L"+x(i)+" "+y(values[i]);
+  add("path",{d:line+" V"+bottom+" H"+left+" Z",fill:color,opacity:0.08});
+  add("path",{d:line,stroke:color,"stroke-width":2.3,fill:"none","stroke-linejoin":"round"});
+  add("text",{x:left,y:139},labels[0]);
+  if(values.length>1)add("text",{x:right,y:139,"text-anchor":"end"},labels[values.length-1]);
+  const dot=add("circle",{r:4,fill:color});
+  function focus(i){dot.setAttribute("cx",x(i));dot.setAttribute("cy",y(values[i]));value.textContent=step?usd(values[i]):values[i].toFixed(1)+"¢";legend.textContent=labels[i]}
+  focus(values.length-1);
+  function select(event){const at=(event.clientX-svg.getBoundingClientRect().left-left)/(right-left);
+    focus(Math.max(0,Math.min(values.length-1,Math.round(at*(values.length-1)))))}
+  svg.onpointermove=svg.onpointerdown=select;svg.onpointerleave=()=>focus(values.length-1);
+}
+function graphs(s){
+  const points=s.chart?.points||[];
+  draw("btc",points.map(p=>100*p[1]),points.map(p=>clock(p[0])),"#79dfd4",false,"Waiting for live Kalshi quotes");
+  const equity=s.equity||[];
+  draw("eq",equity,equity.map((_,i)=>i?"Trade "+i:"Start"),"#f1c278",true,"Waiting for account history");
+}
+window.addEventListener("resize",()=>{if(state)graphs(state)});
 function rows(id,values){el(id).replaceChildren(...values.map(row=>{let tr=document.createElement("tr");for(let value of row){let td=document.createElement("td");td.textContent=value;tr.append(td)}return tr}))}
-function paint(s){state=s;el("connection").textContent=(s.age===null?"Worker starting":s.age>50?"Worker heartbeat overdue":"Worker online")+" · "+(s.enabled?"Trading enabled":"Paused");
+function paint(s){state=s;graphs(s);el("connection").textContent=(s.age===null?"Worker starting":s.age>50?"Worker heartbeat overdue":"Worker online")+" · "+(s.enabled?"Trading enabled":"Paused");
 el("cards").replaceChildren(...[["Available paper cash",usd(s.cash)],["Realized P/L",usd(s.all.net)],["Win rate",pct(s.all.rate)],["Settled trades",s.all.count]].map(([k,v])=>{let d=document.createElement("div");d.className="card";let l=document.createElement("small"),b=document.createElement("strong");l.textContent=k;b.textContent=v;d.append(l,b);return d}));
-el("chart").textContent=s.chart?"Near-term direction: "+s.chart.direction:"Waiting for current three-hour chart";
-el("moves").textContent=s.chart?s.chart.changes.map((v,i)=>["15 min","1 hour","3 hours"][i]+": "+(v>0?"+":"")+v+"%").join(" · "):"";
-el("status").textContent=s.status;el("market").textContent=[s.btc?"BTC spot "+usd(s.btc):null,s.age===null?null:"Heartbeat "+s.age+"s ago"].filter(Boolean).join(" · ");
+el("chart").textContent=s.chart?s.chart.ticker+" · BTC target "+usd(s.chart.target):"";
+el("moves").textContent=s.chart?"YES ask "+(100*s.chart.yes).toFixed(1)+"¢ · NO ask "+(100*s.chart.no).toFixed(1)+"¢ · Chart shows YES midpoint":"";
+el("status").textContent=s.status;el("market").textContent=s.age===null?"":"Heartbeat "+s.age+"s ago";
 el("exposure").textContent=s.open_count+" of "+s.max_positions+" slots used · "+usd(s.reserved)+" at risk";el("positions").replaceChildren(...s.positions.map(r=>{let p=document.createElement("p");p.textContent=r.market+" · "+r.side+" · "+usd(r.risk)+" at risk";return p}));
-el("learning").textContent=s.active+" · "+s.learning;el("cap").textContent="Maximum loss per trade "+usd(s.cap)+" · Daily loss limit "+usd(s.daily_limit)+" · Today (UTC) "+usd(s.today);
+el("learning").textContent="Forecast model: "+s.active+" · "+s.learning;el("cap").textContent="Paper trade range $20–"+usd(s.cap)+" · Current sizing target "+usd(s.target)+" · Daily loss limit "+usd(s.daily_limit)+" · Today (UTC) "+usd(s.today);
 let r=s.review;el("review").textContent=r?"Round "+r.round+" · "+(r.promoted?"Candidate promoted":"Current model retained")+" · Candidate paper P/L "+usd(r.rival.net)+" vs "+usd(r.rival.reference_net)+" at equal $20 budgets.":"The first comparison uses 40 new settled markets after 30 training markets.";
-rows("shadow",[[s.all,"All trades"],[s.filtered,"60% and up"]].map(([m,k])=>[k,m.count,pct(m.rate),usd(m.net),usd(m.drawdown)]));rows("trades",s.recent.map(r=>[r.opened_utc,r.side,(100*r.price).toFixed(2)+"¢",Math.round(100*r.probability)+"%",usd(r.risk),r.result,r.pnl===null?"—":usd(r.pnl)]));
+rows("trades",s.recent.map(r=>[r.opened_utc,r.side+(r.entry_type==="30-minute"?" · 30-min":""),(100*r.price).toFixed(2)+"¢",Math.round(100*r.probability)+"%",usd(r.risk),r.result,r.pnl===null?"—":usd(r.pnl)]));
 el("empty").textContent=s.recent.length?"":"Waiting for the first qualifying trade.";el("account").textContent="Paper account "+s.account+" · "+s.archives+" archived";el("toggle").textContent=s.enabled?"Pause entries":"Resume entries";el("toggle").disabled=false;el("reset").disabled=false}
 async function refresh(){try{let res=await fetch("/state");if(res.status===401){location.replace("/login");return}if(!res.ok)throw Error();paint(await res.json())}catch{el("connection").textContent="Dashboard disconnected · reconnecting"}}
 async function act(action){try{let res=await fetch("/control",{method:"POST",headers:{"Content-Type":"application/json","X-V5-Control":"1"},body:JSON.stringify({action,account:state.account})});el("error").textContent=res.ok?"":await res.text();await refresh()}catch{el("error").textContent="Could not save. Refresh and try again."}}

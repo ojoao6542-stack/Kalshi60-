@@ -1,3 +1,5 @@
+from config import BOT_ID, FIVE_MINUTES
+from decimal import Decimal, ROUND_CEILING
 import json
 import logging
 import math
@@ -6,15 +8,16 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urlencode, quote
+from urllib.error import HTTPError
+from urllib.parse import urlencode, quote, urlsplit
 from urllib.request import Request, urlopen
 
-from strategy import BLOCK, MIN_TRAIN, assess, chart_forecast, chart_side, entry, gains, probability, signal, update
+from strategy import BLOCK, MIN_TRAIN, assess, entry, probability, forecast, update
 
 API = "https://external-api.kalshi.com/trade-api/v2"
-COINBASE = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
-PATH = os.getenv("V5_DB_PATH", "kalshi_v5.sqlite3")
+PATH = os.getenv("PAPER_DB_PATH", BOT_ID + ".sqlite3")
 DAILY = float(os.getenv("DAILY_LOSS_LIMIT", "250"))
 MAX_POSITIONS = 5
 if not math.isfinite(DAILY) or DAILY <= 0:
@@ -36,15 +39,20 @@ def db(write=False):
 
 def initial():
     return dict(seen=0, online=[0.0]*5, active=None, frozen=None, epoch=0, cap=20,
-                active_name="V4 baseline", last_review=None)
+                active_name="Kalshi quote baseline", last_review=None)
 
 
 def init():
     Path(PATH).parent.mkdir(parents=True, exist_ok=True)
     with db(True) as c:
         tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if tables and "v5_accounts" not in tables:
-            raise ValueError("Set V5_DB_PATH to a separate V5 database file.")
+        if tables and "bot_identity" not in tables:
+            raise ValueError("Use a separate database for this bot")
+        c.execute("CREATE TABLE IF NOT EXISTS bot_identity(name TEXT PRIMARY KEY)")
+        identity = c.execute("SELECT name FROM bot_identity").fetchone()
+        if identity and identity[0] != BOT_ID:
+            raise ValueError("Database belongs to another strategy")
+        c.execute("INSERT OR IGNORE INTO bot_identity VALUES(?)", (BOT_ID,))
         c.execute("""CREATE TABLE IF NOT EXISTS v5_accounts (
             id INTEGER PRIMARY KEY, cash REAL DEFAULT 500, enabled INTEGER DEFAULT 1,
             model TEXT, reason TEXT DEFAULT 'Starting worker', heartbeat REAL, btc REAL)""")
@@ -52,8 +60,12 @@ def init():
             id INTEGER PRIMARY KEY, account INTEGER, ticker TEXT, opened REAL, close REAL,
             snap TEXT, actual TEXT, result TEXT, settled REAL, pnl REAL, epoch INTEGER,
             UNIQUE(account,ticker))""")
-        c.execute("CREATE TABLE IF NOT EXISTS chart_cache(id INTEGER PRIMARY KEY, end INTEGER, forecast TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS prices(ts REAL PRIMARY KEY, price REAL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS ticks(ticker TEXT, ts REAL, close REAL, target REAL,
+                     yes REAL, no REAL, mid REAL, PRIMARY KEY(ticker,ts))""")
+        c.execute("CREATE TABLE IF NOT EXISTS cadence(account INTEGER PRIMARY KEY, started REAL NOT NULL)")
+        c.execute("""CREATE TRIGGER IF NOT EXISTS start_cadence AFTER INSERT ON v5_accounts
+                     BEGIN INSERT INTO cadence VALUES(NEW.id, strftime('%s','now')); END""")
+        c.execute("INSERT OR IGNORE INTO cadence SELECT id, ? FROM v5_accounts", (time.time(),))
         c.execute("INSERT OR IGNORE INTO v5_accounts(id,model) VALUES(1,?)", (json.dumps(initial()),))
 
 
@@ -71,25 +83,32 @@ def note(c, aid, msg):
     c.execute("UPDATE v5_accounts SET reason=? WHERE id=?", (msg, aid))
 
 
+class RateLimited(Exception):
+    def __init__(self, url, retry_after):
+        self.provider = urlsplit(url).hostname
+        self.minimum_wait = 0
+        if retry_after:
+            try:
+                self.minimum_wait = max(0, int(retry_after))
+            except ValueError:
+                try:
+                    deadline = parsedate_to_datetime(retry_after).timestamp()
+                    self.minimum_wait = max(0, math.ceil(deadline - time.time()))
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        super().__init__(self.provider)
+
+
 def get(url):
-    with urlopen(Request(url, headers={"User-Agent":"KalshiPaperBot/5.0","Accept":"application/json"}), timeout=7) as response:
-        return json.load(response)
-
-
-def load_chart(now):
-    end = int(now // 300) * 300
-    with db() as c:
-        row = c.execute("SELECT forecast FROM chart_cache WHERE id=1 AND end=?", (end,)).fetchone()
-    if row:
-        return json.loads(row[0])
-    url = COINBASE.rsplit("/",1)[0] + "/candles?" + urlencode(dict(
-        granularity=300, start=datetime.fromtimestamp(end-10800,timezone.utc).isoformat(),
-        end=datetime.fromtimestamp(end,timezone.utc).isoformat()))
-    chart = chart_forecast(get(url), end)
-    if chart:
-        with db(True) as c:
-            c.execute("INSERT OR REPLACE INTO chart_cache VALUES(1,?,?)",(end,json.dumps(chart)))
-    return chart
+    request = Request(url, headers={"User-Agent":"KalshiPaperBot/5.0","Accept":"application/json"})
+    try:
+        with urlopen(request, timeout=7) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        if exc.code != 429:
+            raise
+        exc.close()
+        raise RateLimited(url, exc.headers.get("Retry-After")) from exc
 
 
 def stamp(s):
@@ -103,7 +122,7 @@ def market_feed(now):
         if not m["ticker"].startswith("KXBTC15M-") or m.get("strike_type") not in ("greater", "greater_or_equal", None):
             continue
         close = stamp(m["close_time"])
-        if m.get("floor_strike") and 75 <= close - now <= 720 and stamp(m["open_time"]) <= now:
+        if m.get("floor_strike") and 0 < close - now <= 900 and stamp(m["open_time"]) <= now:
             valid.append((close, m))
     return sorted(valid, key=lambda item: item[0])
 
@@ -121,6 +140,21 @@ def quotes(m):
         return None
 
 
+def complete_quotes(m):
+    if quotes(m) is not None:
+        return m
+    data = get(API + "/markets/" + quote(m["ticker"], safe="") + "/orderbook?depth=1")
+    try:
+        book = data["orderbook_fp"]
+        yes_bid, yes_size = book["yes_dollars"][0]
+        no_bid, no_size = book["no_dollars"][0]
+        return dict(m, yes_ask_dollars=round(1-float(no_bid), 6),
+                    no_ask_dollars=round(1-float(yes_bid), 6),
+                    yes_bid_size_fp=yes_size, yes_ask_size_fp=no_size)
+    except (IndexError, KeyError, TypeError, ValueError):
+        return m
+
+
 def pending(c, aid):
     return c.execute("SELECT * FROM observations WHERE account=? AND result IS NULL ORDER BY id LIMIT 1",(aid,)).fetchone()
 
@@ -132,72 +166,108 @@ def open_risk(c, aid):
     return row[0], row[1]
 
 
-def record(aid, m, close, spot, now, chart):
+def cadence_due(c, aid, now):
+    anchor = c.execute("""SELECT COALESCE(
+        (SELECT MAX(opened) FROM observations WHERE account=? AND actual IS NOT NULL),
+        (SELECT started FROM cadence WHERE account=?))""", (aid, aid)).fetchone()[0]
+    return now >= anchor + 1800
+
+
+def cost(price, contracts):
+    return float(Decimal(str(price)) * contracts), 0
+
+
+def timed_entry(c, account_row, q, p_yes, now):
+    count, reserved = open_risk(c, account_row["id"])
+    budget = min(50, account_row["cash"], DAILY + daily(c, account_row["id"], now) - reserved)
+    if count >= MAX_POSITIONS or budget < 20:
+        return None, "30-minute entry waiting for paper risk budget"
+    candidates = []
+    for side, confidence in (("YES", p_yes), ("NO", 1 - p_yes)):
+        price, depth = q[side]
+        # Binary search for the smallest whole-contract fill reaching $20.
+        low, high = 1, min(depth, math.ceil(20 / price) + 1)
+        if high < 1:
+            continue
+        while low < high:
+            mid = (low + high) // 2
+            if cost(price, mid)[0] < 20:
+                low = mid + 1
+            else:
+                high = mid
+        paid, fee = cost(price, low)
+        if 20 <= paid <= budget:
+            order = dict(side=side, confidence=confidence, n=low, price=price,
+                         paid=paid, fee=fee, timed=True)
+            candidates.append((confidence - paid / low, confidence, order))
+    if not candidates:
+        return None, "30-minute entry waiting for enough quote depth or cash"
+    return max(candidates, key=lambda item: item[:2])[2], "Opened 30-minute paper entry"
+
+
+def record(aid, m, close, now):
+    ticker = m["ticker"]
+    q = quotes(m)
+    remaining = close - now
     with db(True) as c:
         a = account(c)
-        if a["id"] != aid:
+        if a["id"] != aid or not a["enabled"] or not 0 < remaining <= 900:
             return
-        row = c.execute("SELECT id,snap,actual,result FROM observations WHERE account=? AND ticker=?",
-                        (aid,m["ticker"])).fetchone()
-        remaining = close - now
-        stage = 2 if remaining <= 120 else 1 if remaining <= 300 else 0
-        prior = json.loads(row["snap"]) if row else None
-        if row and (row["result"] is not None or stage <= prior.get("stage", 2)):
-            return
-        if not a["enabled"]:
-            return note(c, aid, "Paused")
-        q = quotes(m)
-        if not q:
-            return note(c, aid, "Waiting for valid quotes and a spread of 10¢ or less")
-        samples = c.execute("SELECT ts,price FROM (SELECT * FROM prices ORDER BY ts DESC LIMIT 180) ORDER BY ts").fetchall()
-        strike = float(m["floor_strike"])
-        if not math.isfinite(strike) or strike <= 0 or close-now < 75:
-            return note(c, aid, "Waiting for a valid strike and entry window")
-        if not chart or chart["end"] != int(now//300)*300:
-            return note(c, aid, "Waiting for three complete hours of current BTC candles")
-        side = chart_side(chart,spot,strike,remaining)
-        allowed = (side,) if side else ()
-        s = signal(samples, spot, strike, close-now, q["YES"][0], q["NO"][0])
-        if not s:
-            return note(c, aid, "Collecting a fresh BTC price history")
-        base, x = s
+        if q:
+            mid = (1 + q["YES"][0] - q["NO"][0]) / 2
+            c.execute("INSERT OR REPLACE INTO ticks VALUES(?,?,?,?,?,?,?)",
+                      (ticker,now,close,float(m["floor_strike"]),q["YES"][0],q["NO"][0],mid))
+        c.execute("DELETE FROM ticks WHERE close<?",(now-900,))
+        due = cadence_due(c, aid, now)
+        outside_window = FIVE_MINUTES and not 270 <= remaining <= 300
+        if outside_window and not due:
+            return note(c,aid,"Waiting for next five-minute decision window")
+        if remaining <= 60:
+            return note(c,aid,"Final minute · entries closed")
+        prior = c.execute("SELECT actual,result FROM observations WHERE account=? AND ticker=?",(aid,ticker)).fetchone()
+        if prior and ((FIVE_MINUTES and not due) or prior["actual"] or prior["result"]):
+            return note(c,aid,"Decision recorded for this contract")
+        history = c.execute("SELECT ts,mid FROM ticks WHERE ticker=? AND ts BETWEEN ? AND ? ORDER BY ts",
+                            (ticker,now-90,now)).fetchall()
         model = json.loads(a["model"])
-        snap = prior if row else dict(x=x, spot=spot, strike=strike, quotes=q,
-                                      weights={"base":None,"active":model["active"],"rival":model["frozen"]})
-        snap["stage"] = stage
-        snap["last_chart"] = chart
-        for label, weights in snap["weights"].items():
-            p = probability(base,weights,x)
-            if not row:
-                snap[label] = p
-            if not snap.get(label+"_order"):
-                snap[label+"_order"] = entry(p,q,20,allowed)
+        prediction = forecast(history,q,remaining) if q else None
+        reason = "Collecting recent Kalshi quotes" if q else "Waiting for a valid two-sided Kalshi quote"
+        snap = dict(strategy=BOT_ID, quotes=q, seconds=remaining)
         actual = None
-        count, reserved = open_risk(c, aid)
-        room = min(a["cash"], DAILY + daily(c, aid, now) - reserved, model["cap"])
-        if row and row["actual"]:
-            reason = "Tracking open paper position"
-        elif count >= MAX_POSITIONS:
-            reason = "All five paper position slots are occupied"
-        elif room < 20:
-            reason = "Paper cash or remaining daily loss allowance is below $20"
-        else:
-            actual = entry(probability(base,model["active"],x),q,room,allowed)
-            reason = "Opened paper position" if actual else "Observed market; edge or quoted size did not qualify"
-            if actual:
-                actual["chart"] = chart
-            elif not side:
-                reason = "Chart has no qualifying direction for this strike"
-        if not actual and not (row and row["actual"]) and stage < 2:
-            reason += "; next check at " + ("5" if stage == 0 else "2") + " minutes remaining"
+        if prediction:
+            base, x = prediction
+            snap.update(base=base, x=x)
+            for label, weights in (("base", None), ("active", model["active"]), ("rival", model["frozen"])):
+                prob = probability(base, weights, x)
+                snap[label] = prob
+                snap[label+"_order"] = entry(prob,q,20)
+            count, reserved = open_risk(c, aid)
+            available = min(50, a["cash"], DAILY + daily(c,aid,now) - reserved)
+            if count >= MAX_POSITIONS or available < 20:
+                reason = "Waiting for available paper risk budget"
+            else:
+                choices = []
+                for side in ("YES","NO"):
+                    price = q[side][0]
+                    unit = Decimal(str(price))
+                    min_contracts = (Decimal(20) / unit).to_integral_value(rounding=ROUND_CEILING)
+                    target = max(model["cap"], float(min_contracts * unit))
+                    order = entry(snap["active"],q,min(target,available),allowed=(side,),minimum=20)
+                    if order:
+                        choices.append(order)
+                if choices and not outside_window and not (FIVE_MINUTES and prior):
+                    actual = max(choices,key=lambda o:o["confidence"] - o["paid"]/o["n"])
+                reason = "Opened paper position" if actual else "Entry thresholds or available depth insufficient"
+        if due and actual is None and q:
+            quote_mid = (1 + q["YES"][0] - q["NO"][0]) / 2
+            actual, reason = timed_entry(c, a, q, snap.get("active", quote_mid), now)
+        snap["reason"] = reason
         encoded = json.dumps(actual) if actual else None
-        if row:
-            c.execute("""UPDATE observations SET snap=?,actual=COALESCE(actual,?),
-                         opened=CASE WHEN actual IS NULL AND ? IS NOT NULL THEN ? ELSE opened END
-                         WHERE id=?""",(json.dumps(snap),encoded,encoded,now,row["id"]))
-        else:
-            c.execute("""INSERT INTO observations(account,ticker,opened,close,snap,actual,epoch)
-                         VALUES(?,?,?,?,?,?,?)""",(aid,m["ticker"],now,close,json.dumps(snap),encoded,model["epoch"]))
+        c.execute("""INSERT INTO observations(account,ticker,opened,close,snap,actual,epoch)
+                     VALUES(?,?,?,?,?,?,?)
+                     ON CONFLICT(account,ticker) DO UPDATE SET opened=excluded.opened,
+                       snap=excluded.snap,actual=excluded.actual,epoch=excluded.epoch
+                     WHERE excluded.actual IS NOT NULL OR (json_extract(observations.snap,'$.x') IS NULL AND json_extract(excluded.snap,'$.x') IS NOT NULL)""",(aid,m["ticker"],now,close,json.dumps(snap),encoded,model["epoch"]))
         if actual:
             c.execute("UPDATE v5_accounts SET cash=cash-? WHERE id=?", (actual["paid"],aid))
         note(c, aid, reason)
@@ -208,7 +278,7 @@ def learn(c, aid, model, snap, yes):
     model["seen"] += 1
     if model["epoch"]:
         raw = c.execute("""SELECT snap,result FROM observations WHERE account=? AND epoch=?
-                           AND result IN ('YES','NO') ORDER BY id""",(aid,model["epoch"])).fetchall()
+                           AND json_extract(snap,'$.x') IS NOT NULL AND result IN ('YES','NO') ORDER BY id""",(aid,model["epoch"])).fetchall()
         if len(raw) < BLOCK:
             return
         rows = [dict(json.loads(r["snap"]), yes=int(r["result"]=="YES")) for r in raw]
@@ -241,7 +311,7 @@ def settle(aid, oid, result, value, now):
         pnl = round(payout-order["paid"],6) if order else None
         c.execute("UPDATE observations SET settled=?,result=?,pnl=? WHERE id=?",(now,result,pnl,oid))
         model = json.loads(a["model"])
-        if result in ("YES","NO"):
+        if result in ("YES","NO") and "x" in json.loads(r["snap"]):
             learn(c,aid,model,json.loads(r["snap"]),int(result=="YES"))
         c.execute("UPDATE v5_accounts SET cash=cash+?,model=? WHERE id=?", (payout,json.dumps(model),aid))
 
@@ -267,33 +337,39 @@ def cycle():
                         settle(aid,r["id"],"SCALAR",value,now)
         except (OSError, ValueError, KeyError) as exc:
             logging.warning("Settlement for %s will retry: %s",r["ticker"],exc)
-    tick = get(COINBASE)
-    spot = float(tick["price"])
-    now = time.time()
-    if not math.isfinite(spot) or spot <= 0 or not -5 <= now-stamp(tick["time"]) <= 45:
-        raise ValueError("Waiting for a fresh BTC quote")
-    with db(True) as c:
-        if account(c)["id"] != aid:
-            return
-        c.execute("INSERT OR IGNORE INTO prices VALUES(?,?)",(stamp(tick["time"]),spot))
-        c.execute("DELETE FROM prices WHERE ts<?",(now-3600,))
-        c.execute("UPDATE v5_accounts SET btc=? WHERE id=?",(spot,aid))
+    with db() as c:
         if not account(c)["enabled"]:
-            return note(c,aid,"Paused")
-    chart = load_chart(now)
+            return
     markets = market_feed(time.time())
     if markets:
         for close,m in markets:
-            record(aid,m,close,spot,time.time(),chart)
+            m = complete_quotes(m)
+            record(aid,m,close,time.time())
     else:
         with db(True) as c:
-            note(c,aid,"Waiting for a market with 75 seconds to 12 minutes remaining")
+            note(c,aid,"Waiting for an open BTC market")
 
 
 def worker(stop):
+    backoff = 30
     while not stop.is_set():
         try:
             cycle()
+            backoff = 30
+        except RateLimited as exc:
+            delay = max(backoff, exc.minimum_wait)
+            backoff = min(backoff * 2, 300)
+            deadline = time.monotonic() + delay
+            while not stop.is_set():
+                remaining = math.ceil(deadline - time.monotonic())
+                if remaining <= 0:
+                    break
+                with db(True) as c:
+                    c.execute("UPDATE v5_accounts SET heartbeat=?,reason=? WHERE id=?",
+                              (time.time(), f"{exc.provider} rate limit. Next scan in {remaining}s.",
+                               account(c)["id"]))
+                stop.wait(min(10, remaining))
+            continue
         except Exception as exc:
             logging.exception("Scan failed")
             with db(True) as c:

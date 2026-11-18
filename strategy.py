@@ -1,11 +1,11 @@
 """Signal, sizing and online calibration. Prices and risk caps are in dollars."""
 import math
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal
+from config import MIN_PROBABILITY
 
 MIN_EDGE = 0.12
 MIN_TRAIN = 30
 BLOCK = 40
-CONFIDENCE = 0.60
 
 
 def clamp(x, low, high):
@@ -28,85 +28,32 @@ def update(weights, seen, base, x, yes):
             for w, v in zip(weights, x)]
 
 
-def signal(samples, spot, strike, seconds, yes, no):
-    # Use elapsed times. Ignore history before the latest interruption.
-    tail = []
-    for ts, price in samples:
-        if tail and ts - tail[-1][0] > 40:
-            tail.clear()
-        if not tail or ts > tail[-1][0]:
-            tail.append((ts, price))
-    if len(tail) < 20 or tail[-1][0] - tail[0][0] < 150:
+def forecast(history, quotes, remaining):
+    """Experimental continuation of the current contract's quote momentum."""
+    if len(history) < 4:
         return None
-    elapsed = tail[-1][0] - tail[0][0]
-    variance_rate = sum(math.log(b[1] / a[1]) ** 2 for a, b in zip(tail, tail[1:])) / elapsed
-    if variance_rate < 1e-15:
+    elapsed = history[-1][0] - history[0][0]
+    if elapsed < 30 or any(b[0]-a[0] > 40 for a,b in zip(history,history[1:])):
         return None
-    z = math.log(spot / strike) / math.sqrt(variance_rate * seconds)
-    base = clamp(0.5 * (1 + math.erf(z / math.sqrt(2))), 0.01, 0.99)
-    earlier = next(p for t, p in tail if t >= tail[-1][0] - 60)
-    trend = math.log(spot / earlier) / math.sqrt(60 * variance_rate)
-    mid = (yes + 1 - no) / 2
-    return base, [1.0, clamp(z, -3, 3), 2 * mid - 1, clamp(trend, -3, 3), seconds / 900]
+    mid = history[-1][1]
+    move = mid-history[0][1]
+    drift = clamp(move * min(remaining,120) / elapsed,-.20,.20)
+    spread = quotes["YES"][0]+quotes["NO"][0]-1
+    return clamp(mid+drift,.01,.99), [1.,2*mid-1,clamp(5*move,-1,1),10*spread,remaining/900]
 
 
-def chart_forecast(candles, end):
-    """Three hours of consecutive finalized five-minute bars, as known at end."""
-    bars = {}
-    for row in candles:
-        ts = int(row[0])
-        if ts < end - 10800 or ts >= end:
-            continue
-        op, close = float(row[3]), float(row[4])
-        if all(math.isfinite(v) and v > 0 for v in (op, close)):
-            bars[ts] = (op, close)
-    required = range(end - 10800, end, 300)
-    if any(t not in bars for t in required):
-        return None
-    prices = [bars[end - 10800][0]] + [bars[t][1] for t in required]
-    moves = [math.log(b/a) for a,b in zip(prices,prices[1:])]
-    rms = math.sqrt(sum(v*v for v in moves)/36)
-    returns = [math.log(prices[-1]/prices[-1-n]) for n in (3,12,36)]
-    # Trend-continuation estimate per five minutes, capped for sudden moves.
-    drift = sum(w*r/n for w,r,n in zip((0.5,0.3,0.2),returns,(3,12,36)))
-    drift = clamp(drift, -0.5*rms, 0.5*rms)
-    direction = "MIXED"
-    if rms > 0 and abs(drift) >= 0.10*rms and drift*returns[0] > 0:
-        direction = "UP" if drift > 0 else "DOWN"
-    return dict(end=end, direction=direction, drift=drift,
-                changes=[round(100*math.expm1(v),3) for v in returns])
-
-
-def chart_side(chart, spot, strike, seconds):
-    projected = spot * math.exp(chart["drift"]*seconds/300)
-    if chart["direction"] == "UP" and projected >= strike:
-        return "YES"
-    if chart["direction"] == "DOWN" and projected < strike:
-        return "NO"
-    return None
-
-
-def cost(price, n):
-    p = Decimal(str(price))
-    fee = (Decimal("0.07") * n * p * (1 - p)).quantize(Decimal(".01"), rounding=ROUND_CEILING)
-    return float(n * p + fee), float(fee)
-
-
-def entry(p_yes, quotes, cap, allowed=("YES","NO")):
+def entry(p_yes, quotes, cap, allowed=("YES","NO"), minimum=0):
     choices = []
     for side, p in (("YES", p_yes), ("NO", 1 - p_yes)):
-        if side not in allowed:
+        if side not in allowed or p < MIN_PROBABILITY:
             continue
         price, depth = quotes[side]
-        n = int(cap / price)
-        while n and cost(price, n)[0] > cap:
-            n -= 1
-        if not n or depth < n:
-            continue
-        paid, fee = cost(price, n)
-        edge = p - paid / n
-        if edge >= MIN_EDGE:
-            choices.append((edge, dict(side=side, price=price, n=n, paid=paid, fee=fee, confidence=p)))
+        unit = Decimal(str(price))
+        n = min(depth, int(Decimal(str(cap)) / unit))
+        paid = float(unit * n)
+        edge = round(p-price, 12)
+        if n and paid >= minimum and edge >= MIN_EDGE:
+            choices.append((edge, dict(side=side, price=price, n=n, paid=paid, fee=0, confidence=p)))
     return max(choices, key=lambda pair: pair[0])[1] if choices else None
 
 

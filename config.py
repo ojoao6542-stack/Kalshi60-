@@ -1,0 +1,4 @@
+BOT_ID = "sixty_percent"
+FIVE_MINUTES = False
+MIN_PROBABILITY = 0.6
+DEFAULT_PORT = "8503"
