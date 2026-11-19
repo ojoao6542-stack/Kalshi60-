@@ -20,12 +20,30 @@
 <section><h2>Entry rule</h2><p>Uses three hours of completed BTC candles. Regular entries require at least an 80% estimated win probability for the purchased side and more than one minute remaining. Minimum estimated edge is 12¢ per contract. Paper results exclude fees.</p></section>
 <section><h2>Forecast accuracy</h2><p id="forecast-progress"></p><p id="forecast-scores"></p><small>First valid forecast with 4:30–5:00 left. Lower Brier scores indicate better forecasts. Market uses the ask for the model’s favored side.</small><p><a href="/forecasts.csv">Download forecast history</a></p></section>
 <section><h2>Model and risk</h2><p id="learning"></p><p id="cap"></p><small id="review"></small></section>
-<section><small>Running rule · 80% confidence filter</small><p id="rule-results"></p><h2>Recent trades</h2><div class="scroll"><table><thead><tr><th>Opened (UTC)</th><th>Side</th><th>Entry</th><th>Forecast</th><th>At risk</th><th>Result</th><th>P/L</th></tr></thead><tbody id="trades"></tbody></table></div><p id="empty"></p><a href="/trades.csv">Download trades, including archived accounts (CSV)</a></section>
+<section><small>Running rule · 80% confidence filter</small><p id="rule-results"></p><h2>Daily trades</h2><label>Entry date (New Orleans) <select id="trade-day"></select></label><div class="scroll"><table><thead><tr><th>#</th><th>Opened</th><th>Side</th><th>Entry</th><th>Forecast</th><th>At risk</th><th>Result</th><th>P/L</th></tr></thead><tbody id="trades"></tbody></table></div><p id="empty"></p><a href="/trades.csv">Download trades, including archived accounts (CSV)</a></section>
 <section><h2>Account controls</h2><p id="account"></p><button id="toggle" disabled>Pause</button> <button id="refresh">Refresh</button><p id="error" role="alert"></p><details><summary>Archive and reset</summary><p>Start a fresh $500 account and restart learning. Previous trades stay in the CSV. Pause first if a market is pending.</p><button id="reset" disabled>Archive and restart</button></details></section>
 </main><script>
 const el=id=>document.getElementById(id), usd=n=>n.toLocaleString("en-US",{style:"currency",currency:"USD"}), pct=n=>n==null?"—":n+"%";let state;
 
 const clock=ts=>new Date(ts*1000).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"});
+function updateDailyTrades(days, account) {
+  const selector = el("trade-day");
+  const previous = selector.dataset.account === String(account) ? selector.value : "";
+  const dates = Object.keys(days).sort().reverse();
+  selector.replaceChildren(...dates.map(day => {
+    const count = days[day].length;
+    return new Option(day + " · " + count + (count === 1 ? " trade" : " trades"), day);
+  }));
+  selector.dataset.account = String(account);
+  selector.value = dates.includes(previous) ? previous : dates[0];
+  function display() {
+    const entries = days[selector.value] || [];
+    rows("trades",entries.map((r,i)=>[i+1,r.local_time,r.side+(r.entry_type==="30-minute"?" · 30-min":""),(100*r.price).toFixed(2)+"¢",Math.round(100*r.probability)+"%",usd(r.risk),r.result,r.pnl===null?"—":usd(r.pnl)]).reverse());
+    el("empty").textContent = entries.length ? "" : "No trades opened on this day.";
+  }
+  selector.onchange = display;
+  display();
+}
 function draw(id, values, labels, color, step, empty){
   const svg=el(id+"plot"), value=el(id+"value"), legend=el(id+"legend");
   svg.replaceChildren();svg.onpointermove=svg.onpointerdown=svg.onpointerleave=null;
@@ -82,8 +100,8 @@ const labels={model_yes:"Original",market_yes:"Market",blend_yes:"50/50 blend"};
 el("forecast-scores").textContent=Object.entries(labels).map(([key,label])=>label+" "+(test.scores[key]?.toFixed(3)??"—")).join(" · ");
 el("learning").textContent="Forecast model: "+s.active+" · "+s.learning;el("cap").textContent="Paper trade range $20–"+usd(s.cap)+" · Current sizing target "+usd(s.target)+" · Daily loss limit "+usd(s.daily_limit)+" · Today (UTC) "+usd(s.today);
 let r=s.review;el("review").textContent=r?"Round "+r.round+" · "+(r.promoted?"Candidate promoted":"Current model retained")+" · Candidate paper P/L "+usd(r.rival.net)+" vs "+usd(r.rival.reference_net)+" at equal $20 budgets.":"The first comparison uses 40 new settled markets after 30 training markets.";
-rows("trades",s.recent.map(r=>[r.opened_utc,r.side+(r.entry_type==="30-minute"?" · 30-min":""),(100*r.price).toFixed(2)+"¢",Math.round(100*r.probability)+"%",usd(r.risk),r.result,r.pnl===null?"—":usd(r.pnl)]));
-el("empty").textContent=s.recent.length?"":"Waiting for the first qualifying trade.";el("account").textContent="Paper account "+s.account+" · "+s.archives+" archived";el("toggle").textContent=s.enabled?"Pause entries":"Resume entries";el("toggle").disabled=false;el("reset").disabled=false}
+updateDailyTrades(s.daily_trades,s.account);
+el("account").textContent="Paper account "+s.account+" · "+s.archives+" archived";el("toggle").textContent=s.enabled?"Pause entries":"Resume entries";el("toggle").disabled=false;el("reset").disabled=false}
 async function refresh(){try{let res=await fetch("/state");if(res.status===401){location.replace("/login");return}if(!res.ok)throw Error();paint(await res.json())}catch{el("connection").textContent="Dashboard disconnected · reconnecting"}}
 async function act(action){try{let res=await fetch("/control",{method:"POST",headers:{"Content-Type":"application/json","X-V5-Control":"1"},body:JSON.stringify({action,account:state.account})});el("error").textContent=res.ok?"":await res.text();await refresh()}catch{el("error").textContent="Could not save. Refresh and try again."}}
 el("toggle").onclick=()=>act(state.enabled?"pause":"resume");el("refresh").onclick=refresh;el("reset").onclick=()=>{if(confirm("Archive this account and restart V5 with $500?"))act("reset")};refresh();setInterval(refresh,10000);

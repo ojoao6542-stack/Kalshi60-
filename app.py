@@ -45,6 +45,20 @@ def stats(rows):
                 rate=round(100*wins/len(rows),1) if rows else None)
 
 
+from zoneinfo import ZoneInfo
+
+CENTRAL = ZoneInfo("America/Chicago")
+
+
+def daily_trades(rows):
+    days = {datetime.now(CENTRAL).date().isoformat(): []}
+    for row in sorted(rows, key=lambda item: item["opened_utc"]):
+        opened = datetime.fromisoformat(row["opened_utc"]).replace(tzinfo=timezone.utc).astimezone(CENTRAL)
+        days.setdefault(opened.date().isoformat(), []).append(
+            dict(row, local_time=opened.strftime("%I:%M %p %Z")))
+    return days
+
+
 def snapshot():
     with engine.db() as c:
         c.execute("BEGIN")
@@ -76,7 +90,7 @@ def snapshot():
                               if m["epoch"] else f"Initial training · {m['seen']} of {MIN_TRAIN} markets"),
                     positions=positions, open_count=open_count, max_positions=engine.MAX_POSITIONS,
                     reserved=reserved, all=stats(closed),
-                    recent=rows[-30:][::-1],archives=aid-1)
+                    recent=rows[-30:][::-1],daily_trades=daily_trades(rows),archives=aid-1)
 
 
 def control(action, expected):
